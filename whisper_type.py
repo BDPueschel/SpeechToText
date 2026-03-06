@@ -53,6 +53,10 @@ LLM_MODEL_OPTIONS = [
     "deepseek-r1:8b",
     "deepseek-r1:14b",
     "granite3.2:latest",
+    "dolphin-mistral:latest",
+    "hermes3:latest",
+    "mannix/llama3.1-8b-abliterated:latest",
+    "wizardlm-uncensored:latest",
 ]
 
 # LLM prompt personalities
@@ -108,6 +112,16 @@ LLM_PROMPTS = {
         "with a beginning, middle, and end. Be creative, playful, and dramatic. Add vivid "
         "details and flair. Keep it to 2-4 sentences maximum — punchy and tight. "
         "Do not add any commentary or prefix. Output ONLY the story and absolutely "
+        "nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Emoji": (
+        "TASK: Convert this speech transcription into a sequence of emojis.\n"
+        "RULES: Replace every word, phrase, and idea with the most fitting emoji(s). "
+        "Use ONLY emojis — no letters, no words, no punctuation, no spaces between emojis. "
+        "Capture the full meaning and flow of the original text using emojis alone. "
+        "Be expressive and use a variety of emojis. Output ONLY emojis and absolutely "
         "nothing else.\n"
         "INPUT: {text}\n"
         "OUTPUT:"
@@ -366,6 +380,7 @@ class Bubble:
             "Bullet Points": "#FFA726",  # orange
             "Concise": "#26C6DA",        # cyan
             "Story": "#FF7043",          # coral
+            "Emoji": "#FFEE58",          # yellow
         }
 
         self._mic_images["result"] = self._build_waveform_photo("#4CAF50")
@@ -562,12 +577,8 @@ class Bubble:
                 self._mic_label.config(bg=self.TRANSPARENT)
                 self._mic_label.pack()
                 if style == "recording":
-                    timer_text = text if text else "0:00"
-                    # Extract just the time part if it's "Recording... 0:00"
-                    if "..." in timer_text:
-                        timer_text = timer_text.split("...")[-1].strip()
-                    self._timer_label.config(text=timer_text, fg=color, bg=self.TRANSPARENT)
-                    self._timer_label.pack()
+                    self._timer_label.config(text="0:00", fg=color, bg=self.TRANSPARENT)
+                    # Timer label appears after 3 seconds (handled by _start_recording_timer)
                 self._start_live_fft(color)
 
             self._position_bottom_center()
@@ -584,7 +595,7 @@ class Bubble:
         self._root.after(0, _update)
 
     def debug_navigate(self, direction):
-        """Move highlight left (-1) or right (+1) in Multi-Style Preview."""
+        """Move highlight left (-1) or right (+1) in Multi-Model Preview."""
         def _update():
             cols = getattr(self, "_debug_columns", [])
             if not cols:
@@ -609,7 +620,7 @@ class Bubble:
         self._root.after(0, _update)
 
     def debug_confirm(self, shift_held=False):
-        """Confirm the currently highlighted Multi-Style Preview selection."""
+        """Confirm the currently highlighted Multi-Model Preview selection."""
         def _update():
             cols = getattr(self, "_debug_columns", [])
             sel = getattr(self, "_debug_selected", -1)
@@ -621,7 +632,7 @@ class Bubble:
         self._root.after(0, _update)
 
     def debug_dismiss(self):
-        """Dismiss Multi-Style Preview without selecting."""
+        """Dismiss Multi-Model Preview without selecting."""
         self._root.after(0, self._do_hide)
 
     def hide(self):
@@ -668,10 +679,12 @@ class WhisperTray:
         self._llm_model = LLM_MODEL
         self._llm_prompt = LLM_DEFAULT_PROMPT
         self._llm_debug = False
-        self._auto_submit = False  # Press Enter after pasting from Multi-Style Preview
+        self._llm_preview_styles = list(LLM_PROMPTS.keys())  # All selected by default
+        self._auto_submit = False  # Press Enter after pasting from Multi-Model Preview
         self._whisper_model = WHISPER_MODEL
         self._tone_detect = False
         self._translate_lang = None  # None = off, "Spanish" etc = on
+        self._bubble_duration = BUBBLE_DURATION
         self._cancel_requested = False
         self._recording_timer = None
         # History log
@@ -695,10 +708,16 @@ class WhisperTray:
             self._llm_model = cfg.get("llm_model", self._llm_model)
             self._llm_prompt = cfg.get("llm_prompt", self._llm_prompt)
             self._llm_debug = cfg.get("llm_debug", self._llm_debug)
+            saved_styles = cfg.get("llm_preview_styles", None)
+            if saved_styles is not None:
+                self._llm_preview_styles = [s for s in saved_styles if s in LLM_PROMPTS]
+                if not self._llm_preview_styles:
+                    self._llm_preview_styles = list(LLM_PROMPTS.keys())
             self._auto_submit = cfg.get("auto_submit", self._auto_submit)
             self._whisper_model = cfg.get("whisper_model", self._whisper_model)
             self._tone_detect = cfg.get("tone_detect", self._tone_detect)
             self._translate_lang = cfg.get("translate_lang", self._translate_lang)
+            self._bubble_duration = cfg.get("bubble_duration", self._bubble_duration)
             # Load custom prompts into LLM_PROMPTS
             for name, template in cfg.get("custom_prompts", {}).items():
                 LLM_PROMPTS[name] = template
@@ -723,10 +742,12 @@ class WhisperTray:
             "llm_model": self._llm_model,
             "llm_prompt": self._llm_prompt,
             "llm_debug": self._llm_debug,
+            "llm_preview_styles": self._llm_preview_styles,
             "auto_submit": self._auto_submit,
             "whisper_model": self._whisper_model,
             "tone_detect": self._tone_detect,
             "translate_lang": self._translate_lang,
+            "bubble_duration": self._bubble_duration,
         }
         # Preserve custom_prompts if they exist in the file
         try:
@@ -909,6 +930,7 @@ class WhisperTray:
 
     def transcribe_streaming(self, audio_np):
         """Transcribe and update the bubble progressively as segments arrive."""
+        self._streaming_done = False
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_path = f.name
         try:
@@ -920,9 +942,10 @@ class WhisperTray:
                 text_so_far = " ".join(parts)
                 with self._stream_lock:
                     self._stream_text = text_so_far
-                if BUBBLE_DURATION > 0:
-                    self.bubble.show(text_so_far, style="result", duration=None)
+                if self._bubble_duration > 0 and not self._streaming_done:
+                    self.bubble.show(text_so_far, style="transcribing")
         finally:
+            self._streaming_done = True
             try:
                 os.unlink(tmp_path)
             except OSError:
@@ -964,7 +987,8 @@ class WhisperTray:
             return text
 
     def cleanup_text_all(self, text):
-        """Run all prompt personalities in parallel. Returns dict of {name: result}."""
+        """Run selected prompt personalities in parallel. Returns dict of {name: result}."""
+        styles = self._llm_preview_styles if self._llm_preview_styles else list(LLM_PROMPTS.keys())
         results = {}
         lock = threading.Lock()
 
@@ -973,13 +997,13 @@ class WhisperTray:
             with lock:
                 results[name] = result
 
-        threads = [threading.Thread(target=_run, args=(name,)) for name in LLM_PROMPTS]
+        threads = [threading.Thread(target=_run, args=(name,)) for name in styles]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=6)
         # Fill in any that timed out
-        for name in LLM_PROMPTS:
+        for name in styles:
             if name not in results:
                 results[name] = "(timed out)"
         return results
@@ -1006,13 +1030,18 @@ class WhisperTray:
         print("[CANCEL] Recording cancelled.")
 
     def _start_recording_timer(self):
-        """Update the timer label beneath the waveform every second."""
+        """Show and update the timer label beneath the waveform after 3 seconds."""
         def _tick():
             if not self.is_recording:
                 return
             elapsed = time.time() - self.start_time
             mins, secs = divmod(int(elapsed), 60)
-            self.bubble._root.after(0, lambda: self.bubble._timer_label.config(text=f"{mins}:{secs:02d}"))
+            if elapsed >= 3:
+                self.bubble._root.after(0, lambda m=mins, s=secs: (
+                    self.bubble._timer_label.config(text=f"{m}:{s:02d}"),
+                    self.bubble._timer_label.pack() if not self.bubble._timer_label.winfo_ismapped() else None,
+                    self.bubble._position_bottom_center(),
+                ))
             self._recording_timer = threading.Timer(1.0, _tick)
             self._recording_timer.daemon = True
             self._recording_timer.start()
@@ -1099,7 +1128,7 @@ class WhisperTray:
                     tone_thread.start()
 
                 if self._llm_debug:
-                    # Multi-Style Preview: run all prompts, let user pick
+                    # Multi-Model Preview: run all prompts, let user pick
                     import keyboard as kb
                     all_results = self.cleanup_text_all(raw_text)
                     for name, result in all_results.items():
@@ -1183,18 +1212,18 @@ class WhisperTray:
                             print(f"[TONE ] {tone_emoji}")
                     self.play_chime(CHIME_DONE)
                     self.paste_text(final_text)
-                    if final_text != raw_text and BUBBLE_DURATION > 0:
-                        self.bubble.show(final_text, style="compare", duration=BUBBLE_DURATION, original=raw_text)
-                    elif BUBBLE_DURATION > 0:
-                        self.bubble.show(final_text, style="result", duration=BUBBLE_DURATION)
+                    if final_text != raw_text and self._bubble_duration > 0:
+                        self.bubble.show(final_text, style="compare", duration=self._bubble_duration, original=raw_text)
+                    elif self._bubble_duration > 0:
+                        self.bubble.show(final_text, style="result", duration=self._bubble_duration)
                     else:
                         self.bubble.hide()
                 else:
                     final_text = raw_text
                     self.play_chime(CHIME_DONE)
                     self.paste_text(final_text)
-                    if BUBBLE_DURATION > 0:
-                        self.bubble.show(final_text, style="result", duration=BUBBLE_DURATION)
+                    if self._bubble_duration > 0:
+                        self.bubble.show(final_text, style="result", duration=self._bubble_duration)
                     else:
                         self.bubble.hide()
 
@@ -1321,10 +1350,29 @@ class WhisperTray:
 
         threading.Thread(target=_do_switch, daemon=True).start()
 
+    def _unload_ollama_model(self):
+        """Tell Ollama to unload the current model from memory."""
+        try:
+            payload = json.dumps({
+                "model": self._llm_model,
+                "keep_alive": 0,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"{OLLAMA_URL}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=3)
+            print(f"[LLM  ] Unloaded {self._llm_model} from memory")
+        except Exception as e:
+            print(f"[LLM  ] Failed to unload model: {e}")
+
     def _toggle_llm_cleanup(self):
         self._llm_cleanup = not self._llm_cleanup
         state = "on" if self._llm_cleanup else "off"
         print(f"[LLM  ] Text cleanup {state}")
+        if not self._llm_cleanup:
+            threading.Thread(target=self._unload_ollama_model, daemon=True).start()
         self._save_config()
         self._rebuild_tray_menu()
 
@@ -1334,10 +1382,23 @@ class WhisperTray:
         self._save_config()
         self._rebuild_tray_menu()
 
+    def _toggle_preview_style(self, name):
+        if name in self._llm_preview_styles:
+            if len(self._llm_preview_styles) > 1:
+                self._llm_preview_styles.remove(name)
+            else:
+                print("[LLM  ] Must have at least one preview style selected.")
+                return
+        else:
+            self._llm_preview_styles.append(name)
+        print(f"[LLM  ] Preview styles: {', '.join(self._llm_preview_styles)}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
     def _toggle_llm_debug(self):
         self._llm_debug = not self._llm_debug
         state = "on" if self._llm_debug else "off"
-        print(f"[LLM  ] Multi-Style Preview {state}")
+        print(f"[LLM  ] Multi-Model Preview {state}")
         self._save_config()
         self._rebuild_tray_menu()
 
@@ -1384,155 +1445,246 @@ class WhisperTray:
         self._save_history()
         print("[HIST ] History cleared.")
 
+    # -- Settings window -----------------------
+
+    def _open_settings(self):
+        """Open a persistent settings dialog on the Bubble's tkinter thread."""
+        def _build():
+            if hasattr(self, '_settings_win') and self._settings_win and self._settings_win.winfo_exists():
+                self._settings_win.lift()
+                self._settings_win.focus_force()
+                return
+
+            win = tk.Toplevel(self.bubble._root)
+            self._settings_win = win
+            win.title("Whisper STT Settings")
+            win.attributes("-topmost", True)
+            win.configure(bg="#1e1e1e")
+            win.resizable(False, False)
+
+            # Styling helpers
+            FONT = ("Segoe UI", 10)
+            FONT_BOLD = ("Segoe UI", 10, "bold")
+            FONT_HEADER = ("Segoe UI", 12, "bold")
+            BG = "#1e1e1e"
+            FG = "#e0e0e0"
+            SEC_BG = "#2a2a2a"
+            ACCENT = "#4CAF50"
+
+            def section_header(parent, text, row):
+                tk.Label(parent, text=text, font=FONT_HEADER, bg=BG, fg=ACCENT,
+                         anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
+
+            def add_toggle(parent, label, var, row, command=None):
+                cb = tk.Checkbutton(parent, text=label, variable=var, font=FONT,
+                                    bg=BG, fg=FG, selectcolor="#333333", activebackground=BG,
+                                    activeforeground=FG, anchor="w", command=command)
+                cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=2)
+                return cb
+
+            def add_dropdown(parent, label, var, options, row, command=None):
+                tk.Label(parent, text=label, font=FONT, bg=BG, fg=FG,
+                         anchor="w").grid(row=row, column=0, sticky="w", padx=20, pady=2)
+                om = tk.OptionMenu(parent, var, *options, command=command)
+                om.config(font=FONT, bg="#333333", fg=FG, activebackground="#444444",
+                          activeforeground=FG, highlightthickness=0)
+                om["menu"].config(bg="#333333", fg=FG, font=FONT)
+                om.grid(row=row, column=1, sticky="w", padx=8, pady=2)
+                return om
+
+            columns_frame = tk.Frame(win, bg=BG)
+            columns_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+            # ── Left column: Recording, Whisper, Translation, History ──
+            left = tk.Frame(columns_frame, bg=BG)
+            left.grid(row=0, column=0, sticky="n", padx=(0, 12))
+
+            section_header(left, "Recording", 0)
+
+            hotkey_var = tk.StringVar(value=self._hotkey)
+            add_dropdown(left, "Hotkey:", hotkey_var, HOTKEY_OPTIONS, 1,
+                         command=lambda v: self.change_hotkey(v))
+
+            chime_var = tk.BooleanVar(value=self._chime_enabled)
+            def _on_chime():
+                self._chime_enabled = chime_var.get()
+                self._save_config()
+            add_toggle(left, "Sound chimes", chime_var, 2, _on_chime)
+
+            bubble_dur_var = tk.StringVar(value=str(self._bubble_duration))
+            bubble_options = ["0", "1", "2", "3", "4", "5", "7", "10"]
+            def _on_bubble_dur(v):
+                self._bubble_duration = int(v)
+                self._save_config()
+            add_dropdown(left, "Bubble duration (s):", bubble_dur_var, bubble_options, 3,
+                         command=_on_bubble_dur)
+
+            section_header(left, "Whisper Model", 4)
+
+            whisper_var = tk.StringVar(value=self._whisper_model)
+            add_dropdown(left, "Model:", whisper_var, WHISPER_MODEL_OPTIONS, 5,
+                         command=lambda v: self._set_whisper_model(v))
+
+            lr = 6
+            if self._cuda_available:
+                cuda_var = tk.BooleanVar(value=self._use_cuda)
+                def _on_cuda():
+                    self._use_cuda = cuda_var.get()
+                    self._save_config()
+                    threading.Thread(target=self.reload_model, daemon=True).start()
+                add_toggle(left, "Use GPU (CUDA)", cuda_var, lr, _on_cuda)
+                lr += 1
+
+            section_header(left, "Translation", lr)
+            lr += 1
+
+            trans_options = ["Off"] + TRANSLATE_LANGS
+            trans_var = tk.StringVar(value=self._translate_lang or "Off")
+            def _on_translate(v):
+                self._set_translate_lang(None if v == "Off" else v)
+            add_dropdown(left, "Translate to:", trans_var, trans_options, lr,
+                         command=_on_translate)
+            lr += 1
+
+            section_header(left, "History", lr)
+            lr += 1
+
+            hist_frame = tk.Frame(left, bg=BG)
+            hist_frame.grid(row=lr, column=0, columnspan=2, sticky="w", padx=20, pady=4)
+
+            tk.Label(hist_frame, text=f"{len(self._history)} entries", font=FONT,
+                     bg=BG, fg=FG).pack(side="left", padx=(0, 12))
+            tk.Button(hist_frame, text="Open", font=FONT, bg="#333333", fg=FG,
+                      command=self._open_history).pack(side="left", padx=4)
+            tk.Button(hist_frame, text="Clear", font=FONT, bg="#333333", fg=FG,
+                      command=self._clear_history).pack(side="left", padx=4)
+
+            # Separator
+            sep = tk.Frame(columns_frame, bg="#444444", width=1)
+            sep.grid(row=0, column=1, sticky="ns", padx=4, pady=8)
+
+            # ── Right column: LLM, Multi-Model Preview ──
+            right = tk.Frame(columns_frame, bg=BG)
+            right.grid(row=0, column=2, sticky="n", padx=(12, 0))
+
+            section_header(right, "LLM Text Cleanup", 0)
+
+            llm_var = tk.BooleanVar(value=self._llm_cleanup)
+            def _on_llm():
+                self._llm_cleanup = llm_var.get()
+                self._save_config()
+                self._rebuild_tray_menu()
+            add_toggle(right, "Enable LLM cleanup", llm_var, 1, _on_llm)
+
+            llm_model_var = tk.StringVar(value=self._llm_model)
+            model_om = add_dropdown(right, "LLM model:", llm_model_var,
+                                    LLM_MODEL_OPTIONS, 2,
+                                    command=lambda v: self._set_llm_model(v))
+
+            # Fetch installed models in background to update labels
+            def _refresh_model_labels():
+                installed = self._get_installed_models()
+                def _update():
+                    if not win.winfo_exists():
+                        return
+                    menu = model_om["menu"]
+                    menu.delete(0, "end")
+                    for m in LLM_MODEL_OPTIONS:
+                        label = m if m in installed else f"{m}  [pull]"
+                        menu.add_command(label=label,
+                                         command=lambda v=m: (llm_model_var.set(v), self._set_llm_model(v)))
+                win.after(0, _update)
+            threading.Thread(target=_refresh_model_labels, daemon=True).start()
+
+            prompt_var = tk.StringVar(value=self._llm_prompt)
+            add_dropdown(right, "Active style:", prompt_var, list(LLM_PROMPTS.keys()), 3,
+                         command=lambda v: self._set_llm_prompt(v))
+
+            tone_var = tk.BooleanVar(value=self._tone_detect)
+            def _on_tone():
+                self._tone_detect = tone_var.get()
+                self._save_config()
+                self._rebuild_tray_menu()
+            add_toggle(right, "Tone detection (emoji prefix)", tone_var, 4, _on_tone)
+
+            section_header(right, "Multi-Model Preview", 5)
+
+            debug_var = tk.BooleanVar(value=self._llm_debug)
+            def _on_debug():
+                self._llm_debug = debug_var.get()
+                self._save_config()
+                self._rebuild_tray_menu()
+            add_toggle(right, "Enable Multi-Model Preview", debug_var, 6, _on_debug)
+
+            auto_var = tk.BooleanVar(value=self._auto_submit)
+            def _on_auto():
+                self._auto_submit = auto_var.get()
+                self._save_config()
+            add_toggle(right, "Auto-submit on select (Enter sends)", auto_var, 7, _on_auto)
+
+            # Preview styles checkboxes
+            tk.Label(right, text="Preview styles:", font=FONT, bg=BG, fg=FG,
+                     anchor="w").grid(row=8, column=0, sticky="nw", padx=20, pady=(6, 2))
+
+            style_vars = {}
+            for i, name in enumerate(LLM_PROMPTS):
+                svar = tk.BooleanVar(value=(name in self._llm_preview_styles))
+                style_vars[name] = svar
+                color = self.bubble._debug_colors.get(name, "#FFFFFF")
+
+                def _on_style_toggle(n=name):
+                    checked = [k for k, v in style_vars.items() if v.get()]
+                    if not checked:
+                        style_vars[n].set(True)
+                        return
+                    self._llm_preview_styles = checked
+                    self._save_config()
+
+                cb = tk.Checkbutton(right, text=name, variable=svar, font=FONT,
+                                    bg=BG, fg=color, selectcolor="#333333",
+                                    activebackground=BG, activeforeground=color,
+                                    anchor="w", command=_on_style_toggle)
+                cb.grid(row=9 + i, column=0, columnspan=2, sticky="w", padx=32, pady=1)
+
+            # ── Close button (bottom center, spanning both columns) ──
+            tk.Button(win, text="Close", font=FONT_BOLD, bg="#333333", fg=FG,
+                      command=win.destroy, padx=20, pady=4
+                      ).pack(pady=(12, 12))
+
+            # Center on screen
+            win.update_idletasks()
+            ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry(f"+{(sw - ww) // 2}+{(sh - wh) // 2}")
+
+        self.bubble._root.after(0, _build)
+
     # -- Tray ----------------------------------
 
     def _rebuild_tray_menu(self):
         import pystray
 
-        device_label = f"Device: {self._device.upper()}"
-        if self._cuda_available:
-            device_item = pystray.MenuItem(
-                device_label + " (click to toggle)",
-                lambda icon, item: self.toggle_device(),
-            )
-        else:
-            device_item = pystray.MenuItem(
-                device_label + " (CUDA not available)",
-                lambda: None,
-                enabled=False,
-            )
-
-        # Build hotkey submenu with categories
-        def _make_hotkey_handler(key):
-            return lambda icon, item: self.change_hotkey(key)
-
-        def _make_hotkey_item(key):
-            return pystray.MenuItem(
-                key.upper(),
-                _make_hotkey_handler(key),
-                checked=lambda item, k=key: k == self._hotkey,
-                radio=True,
-            )
-
-        fkeys = [k for k in HOTKEY_OPTIONS if not "+" in k]
-        chords = [k for k in HOTKEY_OPTIONS if "+" in k]
-
-        hotkey_items = [_make_hotkey_item(k) for k in fkeys]
-        if chords:
-            hotkey_items.append(pystray.Menu.SEPARATOR)
-            hotkey_items.extend([_make_hotkey_item(k) for k in chords])
-
-        chime_item = pystray.MenuItem(
-            "Sound chimes",
-            lambda icon, item: self._toggle_chime(),
-            checked=lambda item: self._chime_enabled,
-        )
-
-        # LLM submenu: toggle, prompt style picker, debug mode
-        def _make_prompt_handler(name):
-            return lambda icon, item: self._set_llm_prompt(name)
-
-        prompt_items = [
-            pystray.MenuItem(
-                name,
-                _make_prompt_handler(name),
-                checked=lambda item, n=name: n == self._llm_prompt,
-                radio=True,
-            )
-            for name in LLM_PROMPTS
-        ]
-
-        # Model picker submenu
-        installed = self._get_installed_models()
-
-        def _make_model_handler(m):
-            return lambda icon, item: self._set_llm_model(m)
-
-        model_items = []
-        for m in LLM_MODEL_OPTIONS:
-            is_installed = m in installed
-            label = m if is_installed else f"{m}  [pull]"
-            model_items.append(pystray.MenuItem(
-                label,
-                _make_model_handler(m),
-                checked=lambda item, mn=m: mn == self._llm_model,
-                radio=True,
-            ))
-
-        llm_submenu = pystray.Menu(
-            pystray.MenuItem(
-                "Enabled",
-                lambda icon, item: self._toggle_llm_cleanup(),
-                checked=lambda item: self._llm_cleanup,
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Model", pystray.Menu(*model_items)),
-            pystray.MenuItem("Style", pystray.Menu(*prompt_items)),
-            pystray.MenuItem(
-                "Multi-Style Preview",
-                lambda icon, item: self._toggle_llm_debug(),
-                checked=lambda item: self._llm_debug,
-            ),
-            pystray.MenuItem(
-                "Auto-submit on select",
-                lambda icon, item: self._toggle_auto_submit(),
-                checked=lambda item: self._auto_submit,
-            ),
-        )
-
-        # Whisper model picker
-        def _make_whisper_handler(m):
-            return lambda icon, item: self._set_whisper_model(m)
-
-        whisper_items = [
-            pystray.MenuItem(
-                m,
-                _make_whisper_handler(m),
-                checked=lambda item, mn=m: mn == self._whisper_model,
-                radio=True,
-            )
-            for m in WHISPER_MODEL_OPTIONS
-        ]
-
-        # Translation submenu
-        def _make_translate_handler(lang):
-            return lambda icon, item: self._set_translate_lang(lang)
-
-        translate_items = [
-            pystray.MenuItem(
-                lang,
-                _make_translate_handler(lang),
-                checked=lambda item, l=lang: l == self._translate_lang,
-            )
-            for lang in TRANSLATE_LANGS
-        ]
-
-        # History submenu
-        history_submenu = pystray.Menu(
-            pystray.MenuItem(f"{len(self._history)} entries", lambda: None, enabled=False),
-            pystray.MenuItem("Open history file", lambda icon, item: self._open_history()),
-            pystray.MenuItem("Clear history", lambda icon, item: self._clear_history()),
-        )
+        llm_status = f"LLM: {self._llm_model}" if self._llm_cleanup else "LLM: off"
+        translate_status = f" | Translate → {self._translate_lang}" if self._translate_lang else ""
 
         menu = pystray.Menu(
-            pystray.MenuItem(f"Hold {self._hotkey.upper()} to record (Esc to cancel)", lambda: None, enabled=False),
-            pystray.MenuItem(f"Whisper: {self._whisper_model}", pystray.Menu(*whisper_items)),
-            device_item,
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Hotkey", pystray.Menu(*hotkey_items)),
-            chime_item,
-            pystray.MenuItem(f"LLM ({self._llm_model})", llm_submenu),
             pystray.MenuItem(
-                "Tone detect",
-                lambda icon, item: self._toggle_tone_detect(),
-                checked=lambda item: self._tone_detect,
+                f"Hold {self._hotkey.upper()} to record (Esc to cancel)",
+                lambda: None,
+                enabled=False,
             ),
             pystray.MenuItem(
-                f"Translate{' → ' + self._translate_lang if self._translate_lang else ''}",
-                pystray.Menu(*translate_items),
+                f"Whisper: {self._whisper_model} | {self._device.upper()}{translate_status}",
+                lambda: None,
+                enabled=False,
             ),
-            pystray.MenuItem("History", history_submenu),
+            pystray.MenuItem(
+                llm_status,
+                lambda: None,
+                enabled=False,
+            ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Settings...", lambda icon, item: self._open_settings()),
             pystray.MenuItem("Quit", self.quit_app),
         )
 
