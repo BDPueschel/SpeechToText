@@ -20,6 +20,7 @@ import threading
 import tempfile
 import json
 import ctypes
+from datetime import datetime
 import urllib.request
 import urllib.error
 import tkinter as tk
@@ -29,7 +30,8 @@ import numpy as np
 #  CONFIG
 # ---------------------------------------------
 HOTKEY          = "alt+q"            # Hold to record, release to transcribe + paste
-WHISPER_MODEL   = "base.en"       # tiny.en | base.en | small.en | medium.en
+WHISPER_MODEL   = "base.en"       # Default whisper model
+WHISPER_MODEL_OPTIONS = ["tiny.en", "base.en", "small.en", "medium.en", "large-v3"]
 SAMPLE_RATE     = 16000
 APPEND_ENTER    = False           # Auto-submit with Enter after pasting
 BUBBLE_DURATION = 3             # Seconds to show the result bubble (0 = no result bubble)
@@ -38,6 +40,8 @@ LLM_CLEANUP     = True            # Post-process transcription with a local LLM
 LLM_MODEL       = "llama3.2:latest"  # Default Ollama model for text cleanup
 LLM_TEMPERATURE = 0.0            # Low = deterministic, high = creative
 OLLAMA_URL      = "http://localhost:11434"
+HISTORY_MAX     = 100             # Max entries in history log
+TRANSLATE_LANGS = ["Spanish", "French", "German", "Japanese", "Chinese", "Korean", "Portuguese", "Italian", "Russian", "Arabic"]
 # Models offered in the tray picker (name -> description for tooltip)
 LLM_MODEL_OPTIONS = [
     "llama3.2:latest",
@@ -109,6 +113,26 @@ LLM_PROMPTS = {
         "OUTPUT:"
     ),
 }
+
+# Special prompts (not in the style picker, triggered by separate toggles)
+TONE_PROMPT = (
+    "TASK: Detect the tone of this text and return a single emoji that best represents it.\n"
+    "RULES: Choose from: \u2753 (question), \u2757 (urgent), \U0001f4a1 (idea), "
+    "\U0001f600 (happy/casual), \U0001f614 (frustrated), \U0001f4cb (instructions), "
+    "\U0001f914 (thoughtful), \U0001f525 (excited). Output ONLY the single emoji "
+    "and absolutely nothing else.\n"
+    "INPUT: {text}\n"
+    "OUTPUT:"
+)
+
+TRANSLATE_PROMPT = (
+    "TASK: Translate this text into {language}.\n"
+    "RULES: Produce a natural, accurate translation. Do not add any commentary, "
+    "explanation, or prefix. Output ONLY the translated text and absolutely nothing else.\n"
+    "INPUT: {text}\n"
+    "OUTPUT:"
+)
+
 LLM_DEFAULT_PROMPT = "Minimal"
 # ---------------------------------------------
 
@@ -292,6 +316,16 @@ class Bubble:
             wraplength=500,
         )
 
+        self._timer_label = tk.Label(
+            self._frame,
+            text="0:00",
+            font=("Segoe UI", 12),
+            bg=self.TRANSPARENT,
+            fg="#FFFFFF",
+            padx=4,
+            pady=0,
+        )
+
         # Side-by-side comparison labels for LLM cleanup
         self._compare_frame = tk.Frame(self._frame, bg=self.TRANSPARENT)
         self._orig_label = tk.Label(
@@ -406,6 +440,7 @@ class Bubble:
 
             self._mic_label.pack_forget()
             self._label.pack_forget()
+            self._timer_label.pack_forget()
             self._compare_frame.pack_forget()
             self._debug_frame.pack_forget()
 
@@ -434,7 +469,7 @@ class Bubble:
                 orig_text.grid(row=1, column=0, columnspan=len(debug_results), sticky="we", padx=4, pady=(0, 8))
 
                 hint = tk.Label(
-                    self._debug_frame, text="\u2190 \u2192 to navigate, Enter to select, or click",
+                    self._debug_frame, text="\u2190 \u2192 navigate  |  Enter = paste + send  |  Shift+Enter or Shift+click = paste only",
                     font=("Segoe UI", 9), bg="#222222", fg="#666666",
                     padx=8, pady=0,
                 )
@@ -464,8 +499,9 @@ class Bubble:
 
                     # Click handler
                     def _on_click(e, txt=result_text):
+                        shift = bool(e.state & 0x1)  # Shift modifier flag
                         if self._on_select:
-                            self._on_select(txt)
+                            self._on_select(txt, shift_held=shift)
                         self._do_hide()
 
                     # Hover effects
@@ -525,6 +561,13 @@ class Bubble:
                 color = self.COLORS[style]["bg"]
                 self._mic_label.config(bg=self.TRANSPARENT)
                 self._mic_label.pack()
+                if style == "recording":
+                    timer_text = text if text else "0:00"
+                    # Extract just the time part if it's "Recording... 0:00"
+                    if "..." in timer_text:
+                        timer_text = timer_text.split("...")[-1].strip()
+                    self._timer_label.config(text=timer_text, fg=color, bg=self.TRANSPARENT)
+                    self._timer_label.pack()
                 self._start_live_fft(color)
 
             self._position_bottom_center()
@@ -565,7 +608,7 @@ class Bubble:
             b.config(bg="#444444")
         self._root.after(0, _update)
 
-    def debug_confirm(self):
+    def debug_confirm(self, shift_held=False):
         """Confirm the currently highlighted Multi-Style Preview selection."""
         def _update():
             cols = getattr(self, "_debug_columns", [])
@@ -573,7 +616,7 @@ class Bubble:
             if 0 <= sel < len(cols):
                 _, _, _, txt = cols[sel]
                 if self._on_select:
-                    self._on_select(txt)
+                    self._on_select(txt, shift_held=shift_held)
                 self._do_hide()
         self._root.after(0, _update)
 
@@ -626,6 +669,15 @@ class WhisperTray:
         self._llm_prompt = LLM_DEFAULT_PROMPT
         self._llm_debug = False
         self._auto_submit = False  # Press Enter after pasting from Multi-Style Preview
+        self._whisper_model = WHISPER_MODEL
+        self._tone_detect = False
+        self._translate_lang = None  # None = off, "Spanish" etc = on
+        self._cancel_requested = False
+        self._recording_timer = None
+        # History log
+        self._history_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper_history.json")
+        self._history = []
+        self._load_history()
         # Streaming transcription state
         self._stream_text = ""
         self._stream_lock = threading.Lock()
@@ -644,6 +696,12 @@ class WhisperTray:
             self._llm_prompt = cfg.get("llm_prompt", self._llm_prompt)
             self._llm_debug = cfg.get("llm_debug", self._llm_debug)
             self._auto_submit = cfg.get("auto_submit", self._auto_submit)
+            self._whisper_model = cfg.get("whisper_model", self._whisper_model)
+            self._tone_detect = cfg.get("tone_detect", self._tone_detect)
+            self._translate_lang = cfg.get("translate_lang", self._translate_lang)
+            # Load custom prompts into LLM_PROMPTS
+            for name, template in cfg.get("custom_prompts", {}).items():
+                LLM_PROMPTS[name] = template
             if self._cuda_available:
                 self._use_cuda = cfg.get("use_cuda", self._use_cuda)
             # Validate llm_prompt still exists
@@ -666,12 +724,49 @@ class WhisperTray:
             "llm_prompt": self._llm_prompt,
             "llm_debug": self._llm_debug,
             "auto_submit": self._auto_submit,
+            "whisper_model": self._whisper_model,
+            "tone_detect": self._tone_detect,
+            "translate_lang": self._translate_lang,
         }
+        # Preserve custom_prompts if they exist in the file
+        try:
+            with open(self._config_path, "r") as f:
+                existing = json.load(f)
+            if "custom_prompts" in existing:
+                cfg["custom_prompts"] = existing["custom_prompts"]
+        except Exception:
+            pass
         try:
             with open(self._config_path, "w") as f:
                 json.dump(cfg, f, indent=2)
         except Exception as e:
             print(f"[CONF ] Failed to save config: {e}")
+
+    def _load_history(self):
+        try:
+            with open(self._history_path, "r") as f:
+                self._history = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._history = []
+
+    def _save_history(self):
+        try:
+            with open(self._history_path, "w") as f:
+                json.dump(self._history[-HISTORY_MAX:], f, indent=2)
+        except Exception as e:
+            print(f"[HIST ] Failed to save history: {e}")
+
+    def _add_history(self, raw, final, style=None, tone=None):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "raw": raw,
+            "final": final,
+            "style": style,
+            "tone": tone,
+        }
+        self._history.append(entry)
+        self._save_history()
+        print(f"[HIST ] Saved ({len(self._history)} entries)")
 
     @property
     def _device(self):
@@ -687,7 +782,7 @@ class WhisperTray:
         test_script = (
             "import sys, tempfile, wave, numpy as np\n"
             "from faster_whisper import WhisperModel\n"
-            f"model = WhisperModel('{WHISPER_MODEL}', device='cuda', compute_type='float16')\n"
+            f"model = WhisperModel('{self._whisper_model}', device='cuda', compute_type='float16')\n"
             "path = tempfile.mktemp(suffix='.wav')\n"
             "pcm = np.zeros(16000, dtype=np.int16)\n"  # 1s silence
             "with wave.open(path, 'w') as wf:\n"
@@ -722,14 +817,14 @@ class WhisperTray:
 
         device = self._device
         compute = self._compute_type
-        print(f"[INIT ] Loading Whisper '{WHISPER_MODEL}' on {device} ({compute})...")
+        print(f"[INIT ] Loading Whisper '{self._whisper_model}' on {device} ({compute})...")
         try:
-            self.model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+            self.model = WhisperModel(self._whisper_model, device=device, compute_type=compute)
         except Exception as e:
             if device == "cuda":
                 print(f"[WARN ] CUDA failed ({e}), falling back to CPU...")
                 self._use_cuda = False
-                self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                self.model = WhisperModel(self._whisper_model, device="cpu", compute_type="int8")
             else:
                 raise
         print(f"[READY] Model loaded on {self._device}. Hold {self._hotkey.upper()} to record.")
@@ -739,16 +834,19 @@ class WhisperTray:
         from faster_whisper import WhisperModel
         device = self._device
         compute = self._compute_type
-        print(f"[INIT ] Reloading Whisper on {device} ({compute})...")
+        print(f"[INIT ] Reloading Whisper '{self._whisper_model}' on {device} ({compute})...")
+        self.bubble.show(f"Loading {self._whisper_model}...", style="transcribing")
         try:
-            self.model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+            self.model = WhisperModel(self._whisper_model, device=device, compute_type=compute)
             print(f"[READY] Model reloaded on {device}.")
+            self.bubble.show(f"{self._whisper_model} ready!", style="result", duration=2)
         except Exception as e:
             if device == "cuda":
                 print(f"[WARN ] CUDA failed ({e}), falling back to CPU...")
                 self._use_cuda = False
-                self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                self.model = WhisperModel(self._whisper_model, device="cpu", compute_type="int8")
                 print(f"[READY] Model reloaded on CPU.")
+                self.bubble.show(f"{self._whisper_model} ready (CPU)", style="result", duration=2)
             else:
                 raise
         self._rebuild_tray_menu()
@@ -896,22 +994,67 @@ class WhisperTray:
             time.sleep(0.05)
             pyautogui.press("enter")
 
+    def _cancel_recording(self):
+        """Cancel the current recording without transcribing."""
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self._cancel_requested = True
+        self.audio_buffer.clear()
+        self.set_icon(self.COLOR_READY)
+        self.bubble.show("Cancelled", style="transcribing", duration=1)
+        print("[CANCEL] Recording cancelled.")
+
+    def _start_recording_timer(self):
+        """Update the timer label beneath the waveform every second."""
+        def _tick():
+            if not self.is_recording:
+                return
+            elapsed = time.time() - self.start_time
+            mins, secs = divmod(int(elapsed), 60)
+            self.bubble._root.after(0, lambda: self.bubble._timer_label.config(text=f"{mins}:{secs:02d}"))
+            self._recording_timer = threading.Timer(1.0, _tick)
+            self._recording_timer.daemon = True
+            self._recording_timer.start()
+        self._recording_timer = threading.Timer(1.0, _tick)
+        self._recording_timer.daemon = True
+        self._recording_timer.start()
+
     def on_key_down(self):
         if self.is_recording:
             return
         self.is_recording = True
+        self._cancel_requested = False
         self.audio_buffer.clear()
         self._viz_buffer[:] = 0
         self._stream_text = ""
         self.start_time = time.time()
         self.set_icon(self.COLOR_RECORDING)
-        self.bubble.show("Recording...", style="recording")
+        self.bubble.show("0:00", style="recording")
         self.play_chime(CHIME_START)
+        self._start_recording_timer()
+        # Register Escape to cancel
+        import keyboard as kb
+        kb.on_press_key("esc", lambda e: self._cancel_recording(), suppress=False)
 
     def on_key_up(self):
-        if not self.is_recording:
+        if not self.is_recording and not self._cancel_requested:
             return
         self.is_recording = False
+        if self._recording_timer:
+            self._recording_timer.cancel()
+            self._recording_timer = None
+        # Remove escape cancel hook
+        import keyboard as kb
+        try:
+            kb.unhook_key("esc")
+        except (ValueError, KeyError):
+            pass
+
+        if self._cancel_requested:
+            self._cancel_requested = False
+            return
+
         elapsed = time.time() - self.start_time
 
         if elapsed < 0.3 or not self.audio_buffer:
@@ -931,12 +1074,44 @@ class WhisperTray:
             if raw_text:
                 print(f"[TEXT ] {raw_text}")
 
+                # Tone detection (runs in parallel with cleanup)
+                tone_emoji = None
+                tone_thread = None
+                if self._tone_detect:
+                    tone_result = [None]
+                    valid_emojis = {"\u2753", "\u2757", "\U0001f4a1", "\U0001f600",
+                                    "\U0001f614", "\U0001f4cb", "\U0001f914", "\U0001f525"}
+                    def _detect_tone():
+                        try:
+                            prompt = TONE_PROMPT.format(text=raw_text)
+                            raw_tone = self._call_ollama(prompt).strip()
+                            # Extract first emoji character from response
+                            for ch in raw_tone:
+                                if ch in valid_emojis:
+                                    tone_result[0] = ch
+                                    return
+                            # If no exact match, just use the first character if it's non-ASCII
+                            if raw_tone and ord(raw_tone[0]) > 127:
+                                tone_result[0] = raw_tone[0]
+                        except Exception as e:
+                            print(f"[TONE ] Detection failed: {e}")
+                    tone_thread = threading.Thread(target=_detect_tone, daemon=True)
+                    tone_thread.start()
+
                 if self._llm_debug:
                     # Multi-Style Preview: run all prompts, let user pick
                     import keyboard as kb
                     all_results = self.cleanup_text_all(raw_text)
                     for name, result in all_results.items():
                         print(f"[LLM  ] {name}: {result}")
+                    # Wait for tone detection and prepend emoji to each result
+                    detected_tone = None
+                    if tone_thread:
+                        tone_thread.join(timeout=3)
+                        detected_tone = tone_result[0]
+                        if detected_tone:
+                            print(f"[TONE ] {detected_tone}")
+                            all_results = {name: f"{detected_tone} {txt}" for name, txt in all_results.items()}
                     # Save the foreground window so we can restore it on select
                     user32 = ctypes.windll.user32
                     saved_hwnd = user32.GetForegroundWindow()
@@ -947,18 +1122,26 @@ class WhisperTray:
                             kb.unhook(h)
                         nav_hooks.clear()
 
-                    def _on_debug_select(selected_text):
+                    def _on_debug_select(selected_text, shift_held=False):
                         import pyautogui
+                        print(f"[LLM  ] Selected (shift={shift_held}): {selected_text}")
+                        # Delay hook cleanup so Enter key-up doesn't leak through
+                        time.sleep(0.15)
                         _cleanup_hooks()
-                        print(f"[LLM  ] Selected: {selected_text}")
                         user32.SetForegroundWindow(saved_hwnd)
                         time.sleep(0.1)
                         self.paste_text(selected_text)
-                        if self._auto_submit:
+                        if self._auto_submit and not shift_held:
                             time.sleep(0.05)
                             pyautogui.press("enter")
 
+                    _shift_state = [False]
+
                     def _on_nav_key(e):
+                        # Track shift state from the hook itself
+                        if e.name in ("shift", "left shift", "right shift"):
+                            _shift_state[0] = (e.event_type == "down")
+                            return
                         if e.event_type != "down":
                             return
                         if e.name in ("right", "down"):
@@ -966,7 +1149,7 @@ class WhisperTray:
                         elif e.name in ("left", "up"):
                             self.bubble.debug_navigate(-1)
                         elif e.name == "enter":
-                            self.bubble.debug_confirm()
+                            self.bubble.debug_confirm(shift_held=_shift_state[0])
                         elif e.name == "esc":
                             _cleanup_hooks()
                             self.bubble.debug_dismiss()
@@ -974,12 +1157,30 @@ class WhisperTray:
                     nav_hooks.append(kb.hook(_on_nav_key, suppress=True))
                     self.bubble._on_select = _on_debug_select
                     self.play_chime(CHIME_DONE)
-                    self.bubble.show(None, style="debug", original=raw_text, debug_results=all_results)
+                    original_display = f"{detected_tone} {raw_text}" if detected_tone else raw_text
+                    self.bubble.show(None, style="debug", original=original_display, debug_results=all_results)
                 elif self._llm_cleanup:
                     cleaned = self.cleanup_text(raw_text)
                     if cleaned != raw_text:
                         print(f"[LLM  ] {cleaned}")
                     final_text = cleaned
+                    # Translation pass
+                    if self._translate_lang:
+                        try:
+                            prompt = TRANSLATE_PROMPT.format(language=self._translate_lang, text=final_text)
+                            translated = self._call_ollama(prompt)
+                            if translated:
+                                print(f"[TRANS] {translated}")
+                                final_text = translated
+                        except Exception as e:
+                            print(f"[TRANS] Failed: {e}")
+                    # Tone prefix
+                    if self._tone_detect:
+                        tone_thread.join(timeout=3)
+                        tone_emoji = tone_result[0]
+                        if tone_emoji:
+                            final_text = f"{tone_emoji} {final_text}"
+                            print(f"[TONE ] {tone_emoji}")
                     self.play_chime(CHIME_DONE)
                     self.paste_text(final_text)
                     if final_text != raw_text and BUBBLE_DURATION > 0:
@@ -996,6 +1197,14 @@ class WhisperTray:
                         self.bubble.show(final_text, style="result", duration=BUBBLE_DURATION)
                     else:
                         self.bubble.hide()
+
+                # Log to history
+                self._add_history(
+                    raw=raw_text,
+                    final=final_text if not self._llm_debug else "(preview mode)",
+                    style=self._llm_prompt if self._llm_cleanup else None,
+                    tone=tone_emoji,
+                )
             else:
                 print("[EMPTY] Nothing transcribed.")
                 self.bubble.show("(nothing heard)", style="transcribing", duration=1.5)
@@ -1139,6 +1348,42 @@ class WhisperTray:
         self._save_config()
         self._rebuild_tray_menu()
 
+    def _set_whisper_model(self, model_name):
+        """Switch Whisper model (downloads automatically via faster-whisper)."""
+        self._whisper_model = model_name
+        self._save_config()
+        threading.Thread(target=self.reload_model, daemon=True).start()
+
+    def _toggle_tone_detect(self):
+        self._tone_detect = not self._tone_detect
+        state = "on" if self._tone_detect else "off"
+        print(f"[TONE ] Tone detection {state}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _set_translate_lang(self, lang):
+        """Set translation language. None = off."""
+        if self._translate_lang == lang:
+            self._translate_lang = None
+            print(f"[TRANS] Translation off")
+        else:
+            self._translate_lang = lang
+            print(f"[TRANS] Translate to: {lang}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _open_history(self):
+        """Open history log in default text editor."""
+        if not os.path.exists(self._history_path):
+            print("[HIST ] No history yet.")
+            return
+        os.startfile(self._history_path)
+
+    def _clear_history(self):
+        self._history = []
+        self._save_history()
+        print("[HIST ] History cleared.")
+
     # -- Tray ----------------------------------
 
     def _rebuild_tray_menu(self):
@@ -1235,14 +1480,58 @@ class WhisperTray:
             ),
         )
 
+        # Whisper model picker
+        def _make_whisper_handler(m):
+            return lambda icon, item: self._set_whisper_model(m)
+
+        whisper_items = [
+            pystray.MenuItem(
+                m,
+                _make_whisper_handler(m),
+                checked=lambda item, mn=m: mn == self._whisper_model,
+                radio=True,
+            )
+            for m in WHISPER_MODEL_OPTIONS
+        ]
+
+        # Translation submenu
+        def _make_translate_handler(lang):
+            return lambda icon, item: self._set_translate_lang(lang)
+
+        translate_items = [
+            pystray.MenuItem(
+                lang,
+                _make_translate_handler(lang),
+                checked=lambda item, l=lang: l == self._translate_lang,
+            )
+            for lang in TRANSLATE_LANGS
+        ]
+
+        # History submenu
+        history_submenu = pystray.Menu(
+            pystray.MenuItem(f"{len(self._history)} entries", lambda: None, enabled=False),
+            pystray.MenuItem("Open history file", lambda icon, item: self._open_history()),
+            pystray.MenuItem("Clear history", lambda icon, item: self._clear_history()),
+        )
+
         menu = pystray.Menu(
-            pystray.MenuItem(f"Hold {self._hotkey.upper()} to record", lambda: None, enabled=False),
-            pystray.MenuItem(f"Model: {WHISPER_MODEL}", lambda: None, enabled=False),
+            pystray.MenuItem(f"Hold {self._hotkey.upper()} to record (Esc to cancel)", lambda: None, enabled=False),
+            pystray.MenuItem(f"Whisper: {self._whisper_model}", pystray.Menu(*whisper_items)),
             device_item,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Hotkey", pystray.Menu(*hotkey_items)),
             chime_item,
             pystray.MenuItem(f"LLM ({self._llm_model})", llm_submenu),
+            pystray.MenuItem(
+                "Tone detect",
+                lambda icon, item: self._toggle_tone_detect(),
+                checked=lambda item: self._tone_detect,
+            ),
+            pystray.MenuItem(
+                f"Translate{' → ' + self._translate_lang if self._translate_lang else ''}",
+                pystray.Menu(*translate_items),
+            ),
+            pystray.MenuItem("History", history_submenu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.quit_app),
         )
