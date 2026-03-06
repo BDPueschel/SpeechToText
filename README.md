@@ -58,6 +58,7 @@ First launch downloads the Whisper model (~150MB). Needs internet once.
   - Red waveform = recording
   - Yellow waveform = transcribing
   - Green waveform + white text = result (can be disabled)
+- **Privacy mic mode** -- microphone is only open while you hold the hotkey. No always-on listening. Toggleable from the tray menu
 - **Smooth animations** -- fade in/out transitions, smoothed FFT bars
 - **Duplicate instance protection** -- launching again kills the old instance first
 
@@ -80,6 +81,7 @@ Edit the top of `whisper_type.py`:
 | `WHISPER_MODEL` | `base.en` | Model size: `tiny.en`, `base.en`, `small.en`, `medium.en` |
 | `APPEND_ENTER` | `False` | Press Enter after pasting (auto-submit) |
 | `BUBBLE_DURATION` | `0` | Seconds to show result text (0 = no result bubble) |
+| `PRIVACY_MIC` | `True` | Only open mic while recording (no always-on listening) |
 | `SMOOTHING` | `0.45` | FFT bar smoothing (0 = raw, 1 = frozen) |
 
 ## GPU Acceleration

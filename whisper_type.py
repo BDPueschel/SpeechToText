@@ -30,7 +30,7 @@ SAMPLE_RATE     = 16000
 APPEND_ENTER    = False           # Auto-submit with Enter after pasting
 BUBBLE_DURATION = 0             # Seconds to show the result bubble (0 = no result bubble)
 SMOOTHING       = 0.45            # FFT bar smoothing (0 = no smoothing, 1 = frozen)
-PRIVACY_MIC     = False           # Only open mic while recording (closes between recordings)
+PRIVACY_MIC     = True            # Only open mic while recording (closes between recordings)
 # ---------------------------------------------
 
 NUM_BARS = 10
