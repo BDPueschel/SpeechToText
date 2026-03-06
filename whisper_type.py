@@ -40,6 +40,7 @@ LLM_CLEANUP     = True            # Post-process transcription with a local LLM
 LLM_MODEL       = "llama3.2:latest"  # Default Ollama model for text cleanup
 LLM_TEMPERATURE = 0.0            # Low = deterministic, high = creative
 OLLAMA_URL      = "http://localhost:11434"
+PRIVACY_MIC     = False           # Only open mic while recording (closes between recordings)
 HISTORY_MAX     = 100             # Max entries in history log
 TRANSLATE_LANGS = ["Spanish", "French", "German", "Japanese", "Chinese", "Korean", "Portuguese", "Italian", "Russian", "Arabic"]
 # Models offered in the tray picker (name -> description for tooltip)
@@ -685,6 +686,7 @@ class WhisperTray:
         self._tone_detect = False
         self._translate_lang = None  # None = off, "Spanish" etc = on
         self._bubble_duration = BUBBLE_DURATION
+        self._privacy_mic = PRIVACY_MIC
         self._cancel_requested = False
         self._recording_timer = None
         # History log
@@ -718,6 +720,7 @@ class WhisperTray:
             self._tone_detect = cfg.get("tone_detect", self._tone_detect)
             self._translate_lang = cfg.get("translate_lang", self._translate_lang)
             self._bubble_duration = cfg.get("bubble_duration", self._bubble_duration)
+            self._privacy_mic = cfg.get("privacy_mic", self._privacy_mic)
             # Load custom prompts into LLM_PROMPTS
             for name, template in cfg.get("custom_prompts", {}).items():
                 LLM_PROMPTS[name] = template
@@ -748,6 +751,7 @@ class WhisperTray:
             "tone_detect": self._tone_detect,
             "translate_lang": self._translate_lang,
             "bubble_duration": self._bubble_duration,
+            "privacy_mic": self._privacy_mic,
         }
         # Preserve custom_prompts if they exist in the file
         try:
@@ -884,6 +888,30 @@ class WhisperTray:
     def set_icon(self, color):
         if self.tray:
             self.tray.icon = make_icon_image(color)
+
+    def _open_audio_stream(self):
+        """Open the microphone input stream."""
+        if self.stream is not None:
+            return
+        self.stream = self._sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=self.audio_callback,
+            blocksize=1024,
+        )
+        self.stream.start()
+
+    def _close_audio_stream(self):
+        """Close the microphone input stream."""
+        if self.stream is None:
+            return
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
 
     def audio_callback(self, indata, frames, time_info, status):
         mono = indata[:, 0]
@@ -1023,6 +1051,8 @@ class WhisperTray:
         if not self.is_recording:
             return
         self.is_recording = False
+        if self._privacy_mic:
+            self._close_audio_stream()
         self._cancel_requested = True
         self.audio_buffer.clear()
         self.set_icon(self.COLOR_READY)
@@ -1052,6 +1082,8 @@ class WhisperTray:
     def on_key_down(self):
         if self.is_recording:
             return
+        if self._privacy_mic:
+            self._open_audio_stream()
         self.is_recording = True
         self._cancel_requested = False
         self.audio_buffer.clear()
@@ -1070,6 +1102,8 @@ class WhisperTray:
         if not self.is_recording and not self._cancel_requested:
             return
         self.is_recording = False
+        if self._privacy_mic:
+            self._close_audio_stream()
         if self._recording_timer:
             self._recording_timer.cancel()
             self._recording_timer = None
@@ -1511,21 +1545,33 @@ class WhisperTray:
                 self._save_config()
             add_toggle(left, "Sound chimes", chime_var, 2, _on_chime)
 
+            privacy_var = tk.BooleanVar(value=self._privacy_mic)
+            def _on_privacy():
+                self._privacy_mic = privacy_var.get()
+                if self._privacy_mic:
+                    self._close_audio_stream()
+                    print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
+                else:
+                    self._open_audio_stream()
+                    print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
+                self._save_config()
+            add_toggle(left, "Privacy mic (open only while recording)", privacy_var, 3, _on_privacy)
+
             bubble_dur_var = tk.StringVar(value=str(self._bubble_duration))
             bubble_options = ["0", "1", "2", "3", "4", "5", "7", "10"]
             def _on_bubble_dur(v):
                 self._bubble_duration = int(v)
                 self._save_config()
-            add_dropdown(left, "Bubble duration (s):", bubble_dur_var, bubble_options, 3,
+            add_dropdown(left, "Bubble duration (s):", bubble_dur_var, bubble_options, 4,
                          command=_on_bubble_dur)
 
-            section_header(left, "Whisper Model", 4)
+            section_header(left, "Whisper Model", 5)
 
             whisper_var = tk.StringVar(value=self._whisper_model)
-            add_dropdown(left, "Model:", whisper_var, WHISPER_MODEL_OPTIONS, 5,
+            add_dropdown(left, "Model:", whisper_var, WHISPER_MODEL_OPTIONS, 6,
                          command=lambda v: self._set_whisper_model(v))
 
-            lr = 6
+            lr = 7
             if self._cuda_available:
                 cuda_var = tk.BooleanVar(value=self._use_cuda)
                 def _on_cuda():
@@ -1716,17 +1762,16 @@ class WhisperTray:
         # Start overlay bubble with live FFT feed
         self.bubble = Bubble(fft_callback=self.get_fft_bars)
 
-        # Start audio stream
+        # Audio stream setup
+        self._sd = sd
         default_dev = sd.query_devices(kind='input')
         print(f"[MIC  ] Using: {default_dev['name']} (channels={default_dev['max_input_channels']})")
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=self.audio_callback,
-            blocksize=1024,
-        )
-        self.stream.start()
+        self.stream = None
+        if self._privacy_mic:
+            print(f"[MIC  ] Privacy mic mode: stream opens only while recording.")
+        else:
+            self._open_audio_stream()
+            print(f"[MIC  ] Always-on mic stream started.")
 
         # Start hotkey listener in background thread
         hotkey_thread = threading.Thread(target=self.hotkey_loop, daemon=True)
