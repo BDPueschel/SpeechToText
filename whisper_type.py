@@ -40,7 +40,7 @@ LLM_CLEANUP     = True            # Post-process transcription with a local LLM
 LLM_MODEL       = "llama3.2:latest"  # Default Ollama model for text cleanup
 LLM_TEMPERATURE = 0.0            # Low = deterministic, high = creative
 OLLAMA_URL      = "http://localhost:11434"
-PRIVACY_MIC     = False           # Only open mic while recording (closes between recordings)
+PRIVACY_MIC     = True            # Only open mic while recording (closes between recordings)
 HISTORY_MAX     = 100             # Max entries in history log
 TRANSLATE_LANGS = ["Spanish", "French", "German", "Japanese", "Chinese", "Korean", "Portuguese", "Italian", "Russian", "Arabic"]
 # Models offered in the tray picker (name -> description for tooltip)
