@@ -30,6 +30,7 @@ SAMPLE_RATE     = 16000
 APPEND_ENTER    = False           # Auto-submit with Enter after pasting
 BUBBLE_DURATION = 0             # Seconds to show the result bubble (0 = no result bubble)
 SMOOTHING       = 0.45            # FFT bar smoothing (0 = no smoothing, 1 = frozen)
+PRIVACY_MIC     = False           # Only open mic while recording (closes between recordings)
 # ---------------------------------------------
 
 NUM_BARS = 10
@@ -354,6 +355,7 @@ class WhisperTray:
         self._use_cuda = self._cuda_available  # default to GPU if available
         self._hotkey = HOTKEY
         self._chime_enabled = False
+        self._privacy_mic = PRIVACY_MIC
         # Streaming transcription state
         self._stream_text = ""
         self._stream_lock = threading.Lock()
@@ -451,6 +453,30 @@ class WhisperTray:
         if self.tray:
             self.tray.icon = make_icon_image(color)
 
+    def _open_audio_stream(self):
+        """Open the microphone input stream."""
+        if self.stream is not None:
+            return
+        self.stream = self._sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=self.audio_callback,
+            blocksize=1024,
+        )
+        self.stream.start()
+
+    def _close_audio_stream(self):
+        """Close the microphone input stream."""
+        if self.stream is None:
+            return
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+
     def audio_callback(self, indata, frames, time_info, status):
         mono = indata[:, 0]
         if self.is_recording:
@@ -529,6 +555,8 @@ class WhisperTray:
     def on_key_down(self):
         if self.is_recording:
             return
+        if self._privacy_mic:
+            self._open_audio_stream()
         self.is_recording = True
         self.audio_buffer.clear()
         self._viz_buffer[:] = 0
@@ -542,6 +570,8 @@ class WhisperTray:
         if not self.is_recording:
             return
         self.is_recording = False
+        if self._privacy_mic:
+            self._close_audio_stream()
         elapsed = time.time() - self.start_time
 
         if elapsed < 0.3 or not self.audio_buffer:
@@ -627,6 +657,16 @@ class WhisperTray:
         state = "on" if self._chime_enabled else "off"
         print(f"[CHIME] Sound chimes {state}")
 
+    def _toggle_privacy_mic(self):
+        self._privacy_mic = not self._privacy_mic
+        if self._privacy_mic:
+            self._close_audio_stream()
+            print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
+        else:
+            self._open_audio_stream()
+            print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
+        self._rebuild_tray_menu()
+
     # -- Tray ----------------------------------
 
     def _rebuild_tray_menu(self):
@@ -671,6 +711,12 @@ class WhisperTray:
             checked=lambda item: self._chime_enabled,
         )
 
+        privacy_item = pystray.MenuItem(
+            "Privacy mic (open only while recording)",
+            lambda icon, item: self._toggle_privacy_mic(),
+            checked=lambda item: self._privacy_mic,
+        )
+
         menu = pystray.Menu(
             pystray.MenuItem(f"Hold {self._hotkey.upper()} to record", lambda: None, enabled=False),
             pystray.MenuItem(f"Model: {WHISPER_MODEL}", lambda: None, enabled=False),
@@ -678,6 +724,7 @@ class WhisperTray:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Hotkey", pystray.Menu(*hotkey_items)),
             chime_item,
+            privacy_item,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.quit_app),
         )
@@ -710,17 +757,16 @@ class WhisperTray:
         # Start overlay bubble with live FFT feed
         self.bubble = Bubble(fft_callback=self.get_fft_bars)
 
-        # Start audio stream
+        # Audio stream setup
+        self._sd = sd
         default_dev = sd.query_devices(kind='input')
         print(f"[MIC  ] Using: {default_dev['name']} (channels={default_dev['max_input_channels']})")
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=self.audio_callback,
-            blocksize=1024,
-        )
-        self.stream.start()
+        self.stream = None
+        if self._privacy_mic:
+            print(f"[MIC  ] Privacy mic mode: stream opens only while recording.")
+        else:
+            self._open_audio_stream()
+            print(f"[MIC  ] Always-on mic stream started.")
 
         # Start hotkey listener in background thread
         hotkey_thread = threading.Thread(target=self.hotkey_loop, daemon=True)
