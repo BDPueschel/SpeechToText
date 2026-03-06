@@ -18,6 +18,10 @@ import os
 import wave
 import threading
 import tempfile
+import json
+import ctypes
+import urllib.request
+import urllib.error
 import tkinter as tk
 import numpy as np
 
@@ -28,8 +32,84 @@ HOTKEY          = "alt+q"            # Hold to record, release to transcribe + p
 WHISPER_MODEL   = "base.en"       # tiny.en | base.en | small.en | medium.en
 SAMPLE_RATE     = 16000
 APPEND_ENTER    = False           # Auto-submit with Enter after pasting
-BUBBLE_DURATION = 0             # Seconds to show the result bubble (0 = no result bubble)
+BUBBLE_DURATION = 3             # Seconds to show the result bubble (0 = no result bubble)
 SMOOTHING       = 0.45            # FFT bar smoothing (0 = no smoothing, 1 = frozen)
+LLM_CLEANUP     = True            # Post-process transcription with a local LLM
+LLM_MODEL       = "llama3.2:latest"  # Default Ollama model for text cleanup
+LLM_TEMPERATURE = 0.0            # Low = deterministic, high = creative
+OLLAMA_URL      = "http://localhost:11434"
+# Models offered in the tray picker (name -> description for tooltip)
+LLM_MODEL_OPTIONS = [
+    "llama3.2:latest",
+    "llama3.2:1b",
+    "gemma3:4b",
+    "gemma3:12b",
+    "phi4:latest",
+    "qwen2.5-coder:14b",
+    "deepseek-r1:8b",
+    "deepseek-r1:14b",
+    "granite3.2:latest",
+]
+
+# LLM prompt personalities
+LLM_PROMPTS = {
+    "Minimal": (
+        "TASK: Fix punctuation and capitalization in this speech transcription.\n"
+        "RULES: Do not rephrase, summarize, or remove any words. Do not add any "
+        "commentary, explanation, or prefix. Output ONLY the corrected text and "
+        "absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Natural": (
+        "TASK: Clean up this speech transcription into natural written text.\n"
+        "RULES: Fix capitalization and punctuation. Remove filler words (um, uh, like, "
+        "you know) and false starts. Preserve the speaker's intended meaning. Do not add "
+        "any commentary, explanation, or prefix. Output ONLY the corrected text and "
+        "absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Professional": (
+        "TASK: Rewrite this speech transcription as clean, professional text.\n"
+        "RULES: Fix punctuation, capitalization, and grammar. Remove filler words and "
+        "verbal tics. Lightly restructure run-on sentences for clarity. Keep the original "
+        "meaning and tone. Do not add any commentary, explanation, or prefix. Output ONLY "
+        "the corrected text and absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Bullet Points": (
+        "TASK: Convert this speech transcription into a bullet-point list.\n"
+        "RULES: Extract each distinct thought or idea as its own bullet point. "
+        "Each bullet should be a clear, complete sentence that makes sense on its own. "
+        "Lightly rephrase for readability if needed but preserve the original meaning. "
+        "Fix punctuation and capitalization. Use a dash (-) for each bullet. Do not add "
+        "any commentary, explanation, or prefix. Output ONLY the bullet list and "
+        "absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Concise": (
+        "TASK: Condense this speech transcription to its shortest form.\n"
+        "RULES: Remove all filler, redundancy, and unnecessary words. Keep the full "
+        "meaning intact. Fix punctuation and capitalization. Do not add any commentary, "
+        "explanation, or prefix. Output ONLY the condensed text and absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Story": (
+        "TASK: Transform this speech into a short, whimsical micro-story.\n"
+        "RULES: Take the speaker's words and weave them into a fun, imaginative narrative "
+        "with a beginning, middle, and end. Be creative, playful, and dramatic. Add vivid "
+        "details and flair. Keep it to 2-4 sentences maximum — punchy and tight. "
+        "Do not add any commentary or prefix. Output ONLY the story and absolutely "
+        "nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+}
+LLM_DEFAULT_PROMPT = "Minimal"
 # ---------------------------------------------
 
 NUM_BARS = 10
@@ -172,6 +252,7 @@ class Bubble:
         self._fade_job = None
         self._alpha = 0.0
         self._current_style = None
+        self._on_select = None  # callback(text) when user clicks a debug result
         # Smoothed bar heights for interpolation
         self._smooth_bars = [0.15] * NUM_BARS
 
@@ -210,6 +291,48 @@ class Bubble:
             pady=10,
             wraplength=500,
         )
+
+        # Side-by-side comparison labels for LLM cleanup
+        self._compare_frame = tk.Frame(self._frame, bg=self.TRANSPARENT)
+        self._orig_label = tk.Label(
+            self._compare_frame,
+            text="",
+            font=("Segoe UI", 14),
+            padx=12,
+            pady=8,
+            wraplength=350,
+            justify="left",
+        )
+        self._arrow_label = tk.Label(
+            self._compare_frame,
+            text="\u2192",
+            font=("Segoe UI", 20, "bold"),
+            padx=8,
+            pady=8,
+            bg=self.TRANSPARENT,
+            fg="#FFFFFF",
+        )
+        self._clean_label = tk.Label(
+            self._compare_frame,
+            text="",
+            font=("Segoe UI", 16, "bold"),
+            padx=12,
+            pady=8,
+            wraplength=350,
+            justify="left",
+        )
+
+        # Debug mode: 3-column display for all prompt personalities
+        self._debug_frame = tk.Frame(self._frame, bg=self.TRANSPARENT)
+        self._debug_labels = {}
+        self._debug_colors = {
+            "Minimal": "#42A5F5",        # blue
+            "Natural": "#66BB6A",        # green
+            "Professional": "#AB47BC",   # purple
+            "Bullet Points": "#FFA726",  # orange
+            "Concise": "#26C6DA",        # cyan
+            "Story": "#FF7043",          # coral
+        }
 
         self._mic_images["result"] = self._build_waveform_photo("#4CAF50")
 
@@ -276,15 +399,115 @@ class Bubble:
 
         self._fade_job = self._root.after(self.FADE_MS, _tick)
 
-    def show(self, text, style="recording", duration=None):
+    def show(self, text, style="recording", duration=None, original=None, debug_results=None):
         def _update():
             self._cancel_animations()
             self._current_style = style
 
             self._mic_label.pack_forget()
             self._label.pack_forget()
+            self._compare_frame.pack_forget()
+            self._debug_frame.pack_forget()
 
-            if style == "result":
+            if style == "debug" and debug_results is not None:
+                # Show original + all 3 prompt results as clickable columns
+                self._root.config(bg=self.TRANSPARENT)
+                self._frame.config(bg=self.TRANSPARENT)
+                self._root.attributes("-transparentcolor", self.TRANSPARENT)
+
+                # Clear old debug labels
+                for w in self._debug_frame.winfo_children():
+                    w.destroy()
+
+                # Original text header
+                orig_header = tk.Label(
+                    self._debug_frame, text="Original",
+                    font=("Segoe UI", 10, "bold"), bg="#222222", fg="#888888",
+                    padx=8, pady=2,
+                )
+                orig_header.grid(row=0, column=0, columnspan=len(debug_results), sticky="w", padx=4, pady=(4, 0))
+                orig_text = tk.Label(
+                    self._debug_frame, text=original or text,
+                    font=("Segoe UI", 11), bg="#222222", fg="#AAAAAA",
+                    padx=8, pady=4, wraplength=900, justify="left",
+                )
+                orig_text.grid(row=1, column=0, columnspan=len(debug_results), sticky="we", padx=4, pady=(0, 8))
+
+                hint = tk.Label(
+                    self._debug_frame, text="\u2190 \u2192 to navigate, Enter to select, or click",
+                    font=("Segoe UI", 9), bg="#222222", fg="#666666",
+                    padx=8, pady=0,
+                )
+                hint.grid(row=4, column=0, columnspan=len(debug_results), pady=(4, 2))
+
+                # Build columns and track them for keyboard navigation
+                columns = []  # list of (col_frame, header, body, result_text)
+                for col, (name, result_text) in enumerate(debug_results.items()):
+                    color = self._debug_colors.get(name, "#FFFFFF")
+                    col_frame = tk.Frame(self._debug_frame, bg="#333333", cursor="hand2")
+                    col_frame.grid(row=3, column=col, sticky="nswe", padx=4, pady=(0, 4))
+
+                    header = tk.Label(
+                        col_frame, text=name,
+                        font=("Segoe UI", 9, "bold"), bg="#333333", fg=color,
+                        padx=6, pady=2, cursor="hand2",
+                    )
+                    header.pack(anchor="w")
+                    body = tk.Label(
+                        col_frame, text=result_text,
+                        font=("Segoe UI", 10), bg="#333333", fg=color,
+                        padx=6, pady=4, wraplength=170, justify="left", anchor="nw",
+                        cursor="hand2",
+                    )
+                    body.pack(anchor="w", fill="x")
+                    columns.append((col_frame, header, body, result_text))
+
+                    # Click handler
+                    def _on_click(e, txt=result_text):
+                        if self._on_select:
+                            self._on_select(txt)
+                        self._do_hide()
+
+                    # Hover effects
+                    def _on_enter(e, f=col_frame, h=header, b=body):
+                        f.config(bg="#444444")
+                        h.config(bg="#444444")
+                        b.config(bg="#444444")
+
+                    def _on_leave(e, f=col_frame, h=header, b=body):
+                        f.config(bg="#333333")
+                        h.config(bg="#333333")
+                        b.config(bg="#333333")
+
+                    for widget in (col_frame, header, body):
+                        widget.bind("<Button-1>", _on_click)
+                        widget.bind("<Enter>", _on_enter)
+                        widget.bind("<Leave>", _on_leave)
+
+                # Track columns for external keyboard navigation
+                self._debug_columns = columns
+                self._debug_selected = -1
+
+                self._debug_frame.pack(pady=4)
+                # No auto-dismiss — user must pick a result
+                duration = None
+
+            elif style == "compare" and original is not None:
+                # Side-by-side: original (left) -> cleaned (right)
+                self._root.config(bg=self.TRANSPARENT)
+                self._frame.config(bg=self.TRANSPARENT)
+                self._root.attributes("-transparentcolor", self.TRANSPARENT)
+
+                self._orig_label.config(text=original, bg="#333333", fg="#AAAAAA")
+                self._arrow_label.config(bg=self.TRANSPARENT, fg="#FFFFFF")
+                self._clean_label.config(text=text, bg="#333333", fg="#4CAF50")
+
+                self._orig_label.pack(side="left", padx=(8, 0), pady=4)
+                self._arrow_label.pack(side="left", padx=4, pady=4)
+                self._clean_label.pack(side="left", padx=(0, 8), pady=4)
+                self._compare_frame.pack(pady=4)
+
+            elif style == "result":
                 self._root.config(bg=self.TRANSPARENT)
                 self._frame.config(bg=self.TRANSPARENT)
                 self._root.attributes("-transparentcolor", self.TRANSPARENT)
@@ -317,6 +540,47 @@ class Bubble:
 
         self._root.after(0, _update)
 
+    def debug_navigate(self, direction):
+        """Move highlight left (-1) or right (+1) in Multi-Style Preview."""
+        def _update():
+            cols = getattr(self, "_debug_columns", [])
+            if not cols:
+                return
+            sel = getattr(self, "_debug_selected", -1)
+            # Un-highlight previous
+            if 0 <= sel < len(cols):
+                pf, ph, pb, _ = cols[sel]
+                pf.config(bg="#333333")
+                ph.config(bg="#333333")
+                pb.config(bg="#333333")
+            # Compute new index
+            if direction > 0:
+                new = min(sel + 1, len(cols) - 1) if sel >= 0 else 0
+            else:
+                new = max(sel - 1, 0)
+            self._debug_selected = new
+            f, h, b, _ = cols[new]
+            f.config(bg="#444444")
+            h.config(bg="#444444")
+            b.config(bg="#444444")
+        self._root.after(0, _update)
+
+    def debug_confirm(self):
+        """Confirm the currently highlighted Multi-Style Preview selection."""
+        def _update():
+            cols = getattr(self, "_debug_columns", [])
+            sel = getattr(self, "_debug_selected", -1)
+            if 0 <= sel < len(cols):
+                _, _, _, txt = cols[sel]
+                if self._on_select:
+                    self._on_select(txt)
+                self._do_hide()
+        self._root.after(0, _update)
+
+    def debug_dismiss(self):
+        """Dismiss Multi-Style Preview without selecting."""
+        self._root.after(0, self._do_hide)
+
     def hide(self):
         self._root.after(0, self._do_hide)
 
@@ -339,6 +603,9 @@ class WhisperTray:
     COLOR_RECORDING   = (244, 67, 54, 255)
     COLOR_TRANSCRIBING = (255, 193, 7, 255)
 
+    # Config file lives next to the script
+    _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper_type.json")
+
     def __init__(self):
         self.model = None
         self.audio_buffer = []
@@ -354,9 +621,57 @@ class WhisperTray:
         self._use_cuda = self._cuda_available  # default to GPU if available
         self._hotkey = HOTKEY
         self._chime_enabled = False
+        self._llm_cleanup = LLM_CLEANUP
+        self._llm_model = LLM_MODEL
+        self._llm_prompt = LLM_DEFAULT_PROMPT
+        self._llm_debug = False
+        self._auto_submit = False  # Press Enter after pasting from Multi-Style Preview
         # Streaming transcription state
         self._stream_text = ""
         self._stream_lock = threading.Lock()
+        # Load saved settings (overrides defaults above)
+        self._load_config()
+
+    def _load_config(self):
+        """Load persistent settings from JSON config file."""
+        try:
+            with open(self._config_path, "r") as f:
+                cfg = json.load(f)
+            self._hotkey = cfg.get("hotkey", self._hotkey)
+            self._chime_enabled = cfg.get("chime_enabled", self._chime_enabled)
+            self._llm_cleanup = cfg.get("llm_cleanup", self._llm_cleanup)
+            self._llm_model = cfg.get("llm_model", self._llm_model)
+            self._llm_prompt = cfg.get("llm_prompt", self._llm_prompt)
+            self._llm_debug = cfg.get("llm_debug", self._llm_debug)
+            self._auto_submit = cfg.get("auto_submit", self._auto_submit)
+            if self._cuda_available:
+                self._use_cuda = cfg.get("use_cuda", self._use_cuda)
+            # Validate llm_prompt still exists
+            if self._llm_prompt not in LLM_PROMPTS:
+                self._llm_prompt = LLM_DEFAULT_PROMPT
+            print(f"[CONF ] Loaded settings from {self._config_path}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[CONF ] Failed to load config: {e}")
+
+    def _save_config(self):
+        """Persist current settings to JSON config file."""
+        cfg = {
+            "hotkey": self._hotkey,
+            "chime_enabled": self._chime_enabled,
+            "use_cuda": self._use_cuda,
+            "llm_cleanup": self._llm_cleanup,
+            "llm_model": self._llm_model,
+            "llm_prompt": self._llm_prompt,
+            "llm_debug": self._llm_debug,
+            "auto_submit": self._auto_submit,
+        }
+        try:
+            with open(self._config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as e:
+            print(f"[CONF ] Failed to save config: {e}")
 
     @property
     def _device(self):
@@ -516,6 +831,61 @@ class WhisperTray:
                 pass
         return self._stream_text
 
+    def _call_ollama(self, prompt_text):
+        """Send a prompt to Ollama and return the response text."""
+        payload = json.dumps({
+            "model": self._llm_model,
+            "prompt": prompt_text,
+            "stream": False,
+            "options": {"temperature": LLM_TEMPERATURE, "num_predict": 512},
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        text = result.get("response", "").strip()
+        # Strip wrapping quotes the model sometimes adds
+        if len(text) >= 2 and text[0] in ('"', '\u201c') and text[-1] in ('"', '\u201d'):
+            text = text[1:-1].strip()
+        return text
+
+    def cleanup_text(self, text, prompt_name=None):
+        """Send text to Ollama for cleanup using the selected prompt personality."""
+        name = prompt_name or self._llm_prompt
+        prompt_template = LLM_PROMPTS[name]
+        prompt = prompt_template.format(text=text)
+        try:
+            cleaned = self._call_ollama(prompt)
+            return cleaned if cleaned else text
+        except Exception as e:
+            print(f"[LLM  ] Cleanup failed ({name}): {e}")
+            return text
+
+    def cleanup_text_all(self, text):
+        """Run all prompt personalities in parallel. Returns dict of {name: result}."""
+        results = {}
+        lock = threading.Lock()
+
+        def _run(name):
+            result = self.cleanup_text(text, prompt_name=name)
+            with lock:
+                results[name] = result
+
+        threads = [threading.Thread(target=_run, args=(name,)) for name in LLM_PROMPTS]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=6)
+        # Fill in any that timed out
+        for name in LLM_PROMPTS:
+            if name not in results:
+                results[name] = "(timed out)"
+        return results
+
     def paste_text(self, text):
         import pyperclip
         import pyautogui
@@ -557,15 +927,75 @@ class WhisperTray:
         print(f"[AUDIO] {elapsed:.1f}s, {len(audio_np)} samples, peak={peak:.4f}, rms={rms:.4f}")
 
         def _do_transcribe():
-            text = self.transcribe_streaming(audio_np)
-            if text:
-                print(f"[TEXT ] {text}")
-                self.play_chime(CHIME_DONE)
-                if BUBBLE_DURATION > 0:
-                    self.bubble.show(text, style="result", duration=BUBBLE_DURATION)
+            raw_text = self.transcribe_streaming(audio_np)
+            if raw_text:
+                print(f"[TEXT ] {raw_text}")
+
+                if self._llm_debug:
+                    # Multi-Style Preview: run all prompts, let user pick
+                    import keyboard as kb
+                    all_results = self.cleanup_text_all(raw_text)
+                    for name, result in all_results.items():
+                        print(f"[LLM  ] {name}: {result}")
+                    # Save the foreground window so we can restore it on select
+                    user32 = ctypes.windll.user32
+                    saved_hwnd = user32.GetForegroundWindow()
+                    nav_hooks = []
+
+                    def _cleanup_hooks():
+                        for h in nav_hooks:
+                            kb.unhook(h)
+                        nav_hooks.clear()
+
+                    def _on_debug_select(selected_text):
+                        import pyautogui
+                        _cleanup_hooks()
+                        print(f"[LLM  ] Selected: {selected_text}")
+                        user32.SetForegroundWindow(saved_hwnd)
+                        time.sleep(0.1)
+                        self.paste_text(selected_text)
+                        if self._auto_submit:
+                            time.sleep(0.05)
+                            pyautogui.press("enter")
+
+                    def _on_nav_key(e):
+                        if e.event_type != "down":
+                            return
+                        if e.name in ("right", "down"):
+                            self.bubble.debug_navigate(1)
+                        elif e.name in ("left", "up"):
+                            self.bubble.debug_navigate(-1)
+                        elif e.name == "enter":
+                            self.bubble.debug_confirm()
+                        elif e.name == "esc":
+                            _cleanup_hooks()
+                            self.bubble.debug_dismiss()
+
+                    nav_hooks.append(kb.hook(_on_nav_key, suppress=True))
+                    self.bubble._on_select = _on_debug_select
+                    self.play_chime(CHIME_DONE)
+                    self.bubble.show(None, style="debug", original=raw_text, debug_results=all_results)
+                elif self._llm_cleanup:
+                    cleaned = self.cleanup_text(raw_text)
+                    if cleaned != raw_text:
+                        print(f"[LLM  ] {cleaned}")
+                    final_text = cleaned
+                    self.play_chime(CHIME_DONE)
+                    self.paste_text(final_text)
+                    if final_text != raw_text and BUBBLE_DURATION > 0:
+                        self.bubble.show(final_text, style="compare", duration=BUBBLE_DURATION, original=raw_text)
+                    elif BUBBLE_DURATION > 0:
+                        self.bubble.show(final_text, style="result", duration=BUBBLE_DURATION)
+                    else:
+                        self.bubble.hide()
                 else:
-                    self.bubble.hide()
-                self.paste_text(text)
+                    final_text = raw_text
+                    self.play_chime(CHIME_DONE)
+                    self.paste_text(final_text)
+                    if BUBBLE_DURATION > 0:
+                        self.bubble.show(final_text, style="result", duration=BUBBLE_DURATION)
+                    else:
+                        self.bubble.hide()
             else:
                 print("[EMPTY] Nothing transcribed.")
                 self.bubble.show("(nothing heard)", style="transcribing", duration=1.5)
@@ -607,6 +1037,7 @@ class WhisperTray:
         self._hotkey = new_key
         self._register_hotkey()
         print(f"[KEY  ] Hotkey changed to {new_key.upper()}")
+        self._save_config()
         self._rebuild_tray_menu()
 
     def hotkey_loop(self):
@@ -620,12 +1051,93 @@ class WhisperTray:
             print("[WARN ] CUDA not available on this system.")
             return
         self._use_cuda = not self._use_cuda
+        self._save_config()
         threading.Thread(target=self.reload_model, daemon=True).start()
 
     def _toggle_chime(self):
         self._chime_enabled = not self._chime_enabled
         state = "on" if self._chime_enabled else "off"
         print(f"[CHIME] Sound chimes {state}")
+        self._save_config()
+
+    def _get_installed_models(self):
+        """Query Ollama for locally available models."""
+        try:
+            req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return [m["name"] for m in data.get("models", [])]
+        except Exception:
+            return []
+
+    def _pull_model(self, model_name):
+        """Pull a model from Ollama, showing progress in the bubble."""
+        import subprocess
+        self.bubble.show(f"Pulling {model_name}...", style="transcribing")
+        print(f"[LLM  ] Pulling model: {model_name}")
+        try:
+            result = subprocess.run(
+                ["ollama", "pull", model_name],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                print(f"[LLM  ] Pull complete: {model_name}")
+                self.bubble.show(f"{model_name} ready!", style="result", duration=2)
+                return True
+            else:
+                print(f"[LLM  ] Pull failed: {result.stderr.strip()}")
+                self.bubble.show(f"Pull failed: {model_name}", style="transcribing", duration=3)
+                return False
+        except subprocess.TimeoutExpired:
+            print(f"[LLM  ] Pull timed out: {model_name}")
+            self.bubble.show(f"Pull timed out: {model_name}", style="transcribing", duration=3)
+            return False
+        except Exception as e:
+            print(f"[LLM  ] Pull error: {e}")
+            self.bubble.show(f"Pull error: {model_name}", style="transcribing", duration=3)
+            return False
+
+    def _set_llm_model(self, model_name):
+        """Switch to a different Ollama model, pulling if needed."""
+        def _do_switch():
+            installed = self._get_installed_models()
+            if model_name not in installed:
+                success = self._pull_model(model_name)
+                if not success:
+                    return
+            self._llm_model = model_name
+            print(f"[LLM  ] Model: {model_name}")
+            self._save_config()
+            self._rebuild_tray_menu()
+
+        threading.Thread(target=_do_switch, daemon=True).start()
+
+    def _toggle_llm_cleanup(self):
+        self._llm_cleanup = not self._llm_cleanup
+        state = "on" if self._llm_cleanup else "off"
+        print(f"[LLM  ] Text cleanup {state}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _set_llm_prompt(self, name):
+        self._llm_prompt = name
+        print(f"[LLM  ] Prompt style: {name}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _toggle_llm_debug(self):
+        self._llm_debug = not self._llm_debug
+        state = "on" if self._llm_debug else "off"
+        print(f"[LLM  ] Multi-Style Preview {state}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _toggle_auto_submit(self):
+        self._auto_submit = not self._auto_submit
+        state = "on" if self._auto_submit else "off"
+        print(f"[LLM  ] Auto-submit {state}")
+        self._save_config()
+        self._rebuild_tray_menu()
 
     # -- Tray ----------------------------------
 
@@ -671,6 +1183,58 @@ class WhisperTray:
             checked=lambda item: self._chime_enabled,
         )
 
+        # LLM submenu: toggle, prompt style picker, debug mode
+        def _make_prompt_handler(name):
+            return lambda icon, item: self._set_llm_prompt(name)
+
+        prompt_items = [
+            pystray.MenuItem(
+                name,
+                _make_prompt_handler(name),
+                checked=lambda item, n=name: n == self._llm_prompt,
+                radio=True,
+            )
+            for name in LLM_PROMPTS
+        ]
+
+        # Model picker submenu
+        installed = self._get_installed_models()
+
+        def _make_model_handler(m):
+            return lambda icon, item: self._set_llm_model(m)
+
+        model_items = []
+        for m in LLM_MODEL_OPTIONS:
+            is_installed = m in installed
+            label = m if is_installed else f"{m}  [pull]"
+            model_items.append(pystray.MenuItem(
+                label,
+                _make_model_handler(m),
+                checked=lambda item, mn=m: mn == self._llm_model,
+                radio=True,
+            ))
+
+        llm_submenu = pystray.Menu(
+            pystray.MenuItem(
+                "Enabled",
+                lambda icon, item: self._toggle_llm_cleanup(),
+                checked=lambda item: self._llm_cleanup,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Model", pystray.Menu(*model_items)),
+            pystray.MenuItem("Style", pystray.Menu(*prompt_items)),
+            pystray.MenuItem(
+                "Multi-Style Preview",
+                lambda icon, item: self._toggle_llm_debug(),
+                checked=lambda item: self._llm_debug,
+            ),
+            pystray.MenuItem(
+                "Auto-submit on select",
+                lambda icon, item: self._toggle_auto_submit(),
+                checked=lambda item: self._auto_submit,
+            ),
+        )
+
         menu = pystray.Menu(
             pystray.MenuItem(f"Hold {self._hotkey.upper()} to record", lambda: None, enabled=False),
             pystray.MenuItem(f"Model: {WHISPER_MODEL}", lambda: None, enabled=False),
@@ -678,6 +1242,7 @@ class WhisperTray:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Hotkey", pystray.Menu(*hotkey_items)),
             chime_item,
+            pystray.MenuItem(f"LLM ({self._llm_model})", llm_submenu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.quit_app),
         )
