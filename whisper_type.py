@@ -350,7 +350,7 @@ class Bubble:
         self._timer_label = tk.Label(
             self._frame,
             text="0:00",
-            font=("Segoe UI", 12),
+            font=("Consolas", 12),
             bg=self.TRANSPARENT,
             fg="#FFFFFF",
             padx=4,
@@ -593,7 +593,7 @@ class Bubble:
                 self._mic_label.pack()
                 if style == "recording":
                     self._timer_label.config(text="0:00", fg=color, bg=self.TRANSPARENT)
-                    # Timer label appears after 3 seconds (handled by _start_recording_timer)
+                    self._timer_label.pack()
                 self._start_live_fft(color)
 
             self._position_bottom_center()
@@ -1137,18 +1137,15 @@ class WhisperTray:
         print("[CANCEL] Recording cancelled.")
 
     def _start_recording_timer(self):
-        """Show and update the timer label beneath the waveform after 3 seconds."""
+        """Show and update the timer label every second."""
         def _tick():
             if not self.is_recording:
                 return
             elapsed = time.time() - self.start_time
             mins, secs = divmod(int(elapsed), 60)
-            if elapsed >= 3:
-                self.bubble._root.after(0, lambda m=mins, s=secs: (
-                    self.bubble._timer_label.config(text=f"{m}:{s:02d}"),
-                    self.bubble._timer_label.pack() if not self.bubble._timer_label.winfo_ismapped() else None,
-                    self.bubble._position_bottom_center(),
-                ))
+            self.bubble._root.after(0, lambda m=mins, s=secs: (
+                self.bubble._timer_label.config(text=f"{m}:{s:02d}"),
+            ))
             self._recording_timer = threading.Timer(1.0, _tick)
             self._recording_timer.daemon = True
             self._recording_timer.start()
