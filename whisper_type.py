@@ -20,11 +20,27 @@ import threading
 import tempfile
 import json
 import ctypes
+import logging
 from datetime import datetime
+import http.client
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 import tkinter as tk
 import numpy as np
+
+# --- Session log ---
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session.log")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(threadName)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler(_log_path, mode="w", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("whisper")
 
 # ---------------------------------------------
 #  CONFIG
@@ -541,8 +557,6 @@ class Bubble:
                 self._debug_selected = -1
 
                 self._debug_frame.pack(pady=4)
-                # No auto-dismiss — user must pick a result
-                duration = None
 
             elif style == "compare" and original is not None:
                 # Side-by-side: original (left) -> cleaned (right)
@@ -588,7 +602,7 @@ class Bubble:
 
             self._fade_to(self.MAX_ALPHA)
 
-            if duration:
+            if duration and style != "debug":
                 self._hide_timer = self._root.after(
                     int(duration * 1000), self._do_hide
                 )
@@ -696,6 +710,10 @@ class WhisperTray:
         # Streaming transcription state
         self._stream_text = ""
         self._stream_lock = threading.Lock()
+        self._icon_lock = threading.Lock()
+        self._nav_hooks = []  # Multi-Model Preview keyboard hooks
+        self._ollama_ready = threading.Event()
+        self._ollama_ready.set()  # Ready by default (no warm-up pending)
         # Load saved settings (overrides defaults above)
         self._load_config()
 
@@ -887,7 +905,14 @@ class WhisperTray:
 
     def set_icon(self, color):
         if self.tray:
-            self.tray.icon = make_icon_image(color)
+            if not self._icon_lock.acquire(timeout=2):
+                return  # another thread is updating the icon — skip
+            try:
+                self.tray.icon = make_icon_image(color)
+            except (PermissionError, OSError):
+                pass  # temp .ico file locked — skip update
+            finally:
+                self._icon_lock.release()
 
     def _open_audio_stream(self):
         """Open the microphone input stream."""
@@ -907,7 +932,7 @@ class WhisperTray:
         if self.stream is None:
             return
         try:
-            self.stream.stop()
+            self.stream.abort()
             self.stream.close()
         except Exception:
             pass
@@ -950,7 +975,11 @@ class WhisperTray:
             tmp_path = f.name
         try:
             self.write_wav(tmp_path, audio_np)
-            segments, _ = self.model.transcribe(tmp_path, beam_size=5)
+            lang = "en" if self._whisper_model.endswith(".en") else None
+            segments, _ = self.model.transcribe(
+                tmp_path, beam_size=3, language=lang,
+                vad_filter=True,
+            )
             text = " ".join(s.text.strip() for s in segments).strip()
         finally:
             os.unlink(tmp_path)
@@ -963,7 +992,11 @@ class WhisperTray:
             tmp_path = f.name
         try:
             self.write_wav(tmp_path, audio_np)
-            segments, _ = self.model.transcribe(tmp_path, beam_size=5)
+            lang = "en" if self._whisper_model.endswith(".en") else None
+            segments, _ = self.model.transcribe(
+                tmp_path, beam_size=3, language=lang,
+                vad_filter=True,
+            )
             parts = []
             for seg in segments:
                 parts.append(seg.text.strip())
@@ -980,22 +1013,49 @@ class WhisperTray:
                 pass
         return self._stream_text
 
-    def _call_ollama(self, prompt_text):
+    def _ollama_post(self, path, payload_dict, timeout=30):
+        """Low-level HTTP POST to Ollama using http.client (no urllib global state)."""
+        parsed = urlparse(OLLAMA_URL)
+        model = payload_dict.get("model", "?")
+        log.debug(f"OLLAMA POST {path} model={model} timeout={timeout} connecting...")
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+        try:
+            body = json.dumps(payload_dict).encode("utf-8")
+            log.debug(f"OLLAMA POST {path} sending {len(body)}B...")
+            conn.request("POST", path, body=body, headers={
+                "Content-Type": "application/json",
+                "Connection": "close",
+            })
+            log.debug(f"OLLAMA POST {path} waiting for response...")
+            resp = conn.getresponse()
+            log.debug(f"OLLAMA POST {path} status={resp.status}, reading body...")
+            data = resp.read()
+            log.debug(f"OLLAMA POST {path} got {len(data)}B response")
+            return json.loads(data.decode("utf-8"))
+        finally:
+            conn.close()
+            log.debug(f"OLLAMA POST {path} connection closed")
+
+    def _ollama_get(self, path, timeout=3):
+        """Low-level HTTP GET to Ollama."""
+        parsed = urlparse(OLLAMA_URL)
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"Connection": "close"})
+            resp = conn.getresponse()
+            data = resp.read()
+            return json.loads(data.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def _call_ollama(self, prompt_text, max_tokens=256):
         """Send a prompt to Ollama and return the response text."""
-        payload = json.dumps({
+        result = self._ollama_post("/api/generate", {
             "model": self._llm_model,
             "prompt": prompt_text,
             "stream": False,
-            "options": {"temperature": LLM_TEMPERATURE, "num_predict": 512},
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+            "options": {"temperature": LLM_TEMPERATURE, "num_predict": max_tokens},
+        })
         text = result.get("response", "").strip()
         # Strip wrapping quotes the model sometimes adds
         if len(text) >= 2 and text[0] in ('"', '\u201c') and text[-1] in ('"', '\u201d'):
@@ -1004,7 +1064,10 @@ class WhisperTray:
 
     def cleanup_text(self, text, prompt_name=None):
         """Send text to Ollama for cleanup using the selected prompt personality."""
+        log.debug(f"cleanup_text({prompt_name}): waiting for ollama_ready...")
+        self._ollama_ready.wait(timeout=30)
         name = prompt_name or self._llm_prompt
+        log.debug(f"cleanup_text({name}): calling ollama...")
         prompt_template = LLM_PROMPTS[name]
         prompt = prompt_template.format(text=text)
         try:
@@ -1016,23 +1079,37 @@ class WhisperTray:
 
     def cleanup_text_all(self, text):
         """Run selected prompt personalities in parallel. Returns dict of {name: result}."""
+        # Wait for warm-up to finish so we don't compete with it for Ollama
+        log.debug("cleanup_text_all: waiting for ollama_ready...")
+        self._ollama_ready.wait(timeout=30)
+        log.debug("cleanup_text_all: ollama_ready OK")
         styles = self._llm_preview_styles if self._llm_preview_styles else list(LLM_PROMPTS.keys())
+        log.debug(f"cleanup_text_all: styles={styles}")
         results = {}
         lock = threading.Lock()
+        done = threading.Event()
 
         def _run(name):
+            log.debug(f"cleanup_text_all._run({name}) START")
             result = self.cleanup_text(text, prompt_name=name)
+            log.debug(f"cleanup_text_all._run({name}) DONE: {result[:50] if result else '?'}")
             with lock:
                 results[name] = result
+                log.debug(f"cleanup_text_all: {len(results)}/{len(styles)} complete")
+                if len(results) == len(styles):
+                    done.set()
 
-        threads = [threading.Thread(target=_run, args=(name,)) for name in styles]
+        threads = [threading.Thread(target=_run, args=(name,), daemon=True, name=f"LLM-{name}") for name in styles]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join(timeout=6)
-        # Fill in any that timed out
+        # Single deadline for all threads instead of per-thread timeout
+        log.debug("cleanup_text_all: waiting for all threads (30s deadline)...")
+        done.wait(timeout=30)
+        log.debug(f"cleanup_text_all: done.is_set={done.is_set()}, results={list(results.keys())}")
+        # Fill in any that didn't finish
         for name in styles:
             if name not in results:
+                log.warning(f"cleanup_text_all: {name} TIMED OUT")
                 results[name] = "(timed out)"
         return results
 
@@ -1052,7 +1129,7 @@ class WhisperTray:
             return
         self.is_recording = False
         if self._privacy_mic:
-            self._close_audio_stream()
+            threading.Thread(target=self._close_audio_stream, daemon=True, name="close-stream").start()
         self._cancel_requested = True
         self.audio_buffer.clear()
         self.set_icon(self.COLOR_READY)
@@ -1080,97 +1157,121 @@ class WhisperTray:
         self._recording_timer.start()
 
     def on_key_down(self):
+        log.debug("on_key_down START")
         if self.is_recording:
+            log.debug("on_key_down SKIP (already recording)")
             return
-        if self._privacy_mic:
-            self._open_audio_stream()
+        # Mark recording immediately to prevent re-entry from key repeats
         self.is_recording = True
-        self._cancel_requested = False
-        self.audio_buffer.clear()
-        self._viz_buffer[:] = 0
-        self._stream_text = ""
-        self.start_time = time.time()
-        self.set_icon(self.COLOR_RECORDING)
-        self.bubble.show("0:00", style="recording")
-        self.play_chime(CHIME_START)
-        self._start_recording_timer()
-        # Register Escape to cancel
-        import keyboard as kb
-        kb.on_press_key("esc", lambda e: self._cancel_recording(), suppress=False)
+        # Run the rest off the keyboard thread to avoid blocking it
+        threading.Thread(target=self._do_key_down, daemon=True, name="key-down").start()
+
+    def _do_key_down(self):
+        try:
+            log.debug("_do_key_down START"); sys.stdout.flush()
+            if self._privacy_mic:
+                log.debug("_do_key_down: opening stream"); sys.stdout.flush()
+                self._open_audio_stream()
+            self._cancel_requested = False
+            self.audio_buffer.clear()
+            self._viz_buffer[:] = 0
+            self._stream_text = ""
+            self.start_time = time.time()
+            self.set_icon(self.COLOR_RECORDING)
+            self.bubble.show("0:00", style="recording")
+            self.play_chime(CHIME_START)
+            self._start_recording_timer()
+            # Clean up any stale debug nav hooks from previous multi-model preview
+            self._cleanup_nav_hooks_async()
+            log.debug("_do_key_down DONE"); sys.stdout.flush()
+        except Exception:
+            log.exception("_do_key_down FAILED")
+            self.is_recording = False
 
     def on_key_up(self):
+        log.debug("on_key_up START")
         if not self.is_recording and not self._cancel_requested:
+            log.debug("on_key_up SKIP (not recording)")
             return
         self.is_recording = False
+        # Run the rest off the keyboard thread to avoid blocking it
+        threading.Thread(target=self._do_key_up, daemon=True, name="key-up").start()
+
+    def _do_key_up(self):
+        log.debug("_do_key_up START"); sys.stdout.flush()
         if self._privacy_mic:
             self._close_audio_stream()
         if self._recording_timer:
             self._recording_timer.cancel()
             self._recording_timer = None
-        # Remove escape cancel hook
-        import keyboard as kb
-        try:
-            kb.unhook_key("esc")
-        except (ValueError, KeyError):
-            pass
-
         if self._cancel_requested:
             self._cancel_requested = False
             return
 
         elapsed = time.time() - self.start_time
+        log.debug(f"_do_key_up: elapsed={elapsed:.2f}, buffer={len(self.audio_buffer)}"); sys.stdout.flush()
 
         if elapsed < 0.3 or not self.audio_buffer:
             self.set_icon(self.COLOR_READY)
             self.bubble.hide()
             return
 
+        log.debug("_do_key_up: set_icon TRANSCRIBING"); sys.stdout.flush()
         self.set_icon(self.COLOR_TRANSCRIBING)
+        log.debug("_do_key_up: bubble show"); sys.stdout.flush()
         self.bubble.show("Transcribing...", style="transcribing")
+        log.debug("_do_key_up: concat audio"); sys.stdout.flush()
         audio_np = np.concatenate(self.audio_buffer)
         peak = np.max(np.abs(audio_np))
         rms = np.sqrt(np.mean(audio_np ** 2))
         print(f"[AUDIO] {elapsed:.1f}s, {len(audio_np)} samples, peak={peak:.4f}, rms={rms:.4f}")
 
         def _do_transcribe():
+            log.debug("_do_transcribe START")
+            log.debug("transcribe_streaming START")
             raw_text = self.transcribe_streaming(audio_np)
+            log.debug(f"transcribe_streaming DONE: '{raw_text[:80] if raw_text else ''}'")
             if raw_text:
                 print(f"[TEXT ] {raw_text}")
 
-                # Tone detection (runs in parallel with cleanup)
+                # Tone detection setup
                 tone_emoji = None
+                tone_result = [None]
+                valid_emojis = {"\u2753", "\u2757", "\U0001f4a1", "\U0001f600",
+                                "\U0001f614", "\U0001f4cb", "\U0001f914", "\U0001f525"}
+                def _detect_tone_sync():
+                    try:
+                        prompt = TONE_PROMPT.format(text=raw_text)
+                        raw_tone = self._call_ollama(prompt).strip()
+                        for ch in raw_tone:
+                            if ch in valid_emojis:
+                                tone_result[0] = ch
+                                return
+                        if raw_tone and ord(raw_tone[0]) > 127:
+                            tone_result[0] = raw_tone[0]
+                    except Exception as e:
+                        print(f"[TONE ] Detection failed: {e}")
+
+                # For non-debug paths, run tone in parallel with cleanup
                 tone_thread = None
-                if self._tone_detect:
-                    tone_result = [None]
-                    valid_emojis = {"\u2753", "\u2757", "\U0001f4a1", "\U0001f600",
-                                    "\U0001f614", "\U0001f4cb", "\U0001f914", "\U0001f525"}
-                    def _detect_tone():
-                        try:
-                            prompt = TONE_PROMPT.format(text=raw_text)
-                            raw_tone = self._call_ollama(prompt).strip()
-                            # Extract first emoji character from response
-                            for ch in raw_tone:
-                                if ch in valid_emojis:
-                                    tone_result[0] = ch
-                                    return
-                            # If no exact match, just use the first character if it's non-ASCII
-                            if raw_tone and ord(raw_tone[0]) > 127:
-                                tone_result[0] = raw_tone[0]
-                        except Exception as e:
-                            print(f"[TONE ] Detection failed: {e}")
-                    tone_thread = threading.Thread(target=_detect_tone, daemon=True)
+                if self._tone_detect and not self._llm_debug:
+                    tone_thread = threading.Thread(target=_detect_tone_sync, daemon=True)
                     tone_thread.start()
 
                 if self._llm_debug:
                     # Multi-Model Preview: run all prompts, let user pick
                     import keyboard as kb
+                    log.debug("cleanup_text_all START (multi-model)")
                     all_results = self.cleanup_text_all(raw_text)
+                    log.debug(f"cleanup_text_all DONE: {list(all_results.keys())}")
                     for name, result in all_results.items():
                         print(f"[LLM  ] {name}: {result}")
-                    # Wait for tone detection and prepend emoji to each result
+                    # Run tone detection after multi-model (avoids extra concurrent Ollama connections)
                     detected_tone = None
-                    if tone_thread:
-                        tone_thread.join(timeout=3)
+                    if self._tone_detect:
+                        log.debug("tone_detect START")
+                        _detect_tone_sync()
+                        log.debug("tone_detect DONE")
                         detected_tone = tone_result[0]
                         if detected_tone:
                             print(f"[TONE ] {detected_tone}")
@@ -1178,25 +1279,21 @@ class WhisperTray:
                     # Save the foreground window so we can restore it on select
                     user32 = ctypes.windll.user32
                     saved_hwnd = user32.GetForegroundWindow()
-                    nav_hooks = []
-
-                    def _cleanup_hooks():
-                        for h in nav_hooks:
-                            kb.unhook(h)
-                        nav_hooks.clear()
 
                     def _on_debug_select(selected_text, shift_held=False):
                         import pyautogui
                         print(f"[LLM  ] Selected (shift={shift_held}): {selected_text}")
-                        # Delay hook cleanup so Enter key-up doesn't leak through
-                        time.sleep(0.15)
-                        _cleanup_hooks()
-                        user32.SetForegroundWindow(saved_hwnd)
-                        time.sleep(0.1)
-                        self.paste_text(selected_text)
-                        if self._auto_submit and not shift_held:
-                            time.sleep(0.05)
-                            pyautogui.press("enter")
+                        self._cleanup_nav_hooks_async()
+                        # Run paste on a background thread to avoid blocking tkinter
+                        def _do_paste():
+                            time.sleep(0.1)
+                            user32.SetForegroundWindow(saved_hwnd)
+                            time.sleep(0.1)
+                            self.paste_text(selected_text)
+                            if self._auto_submit and not shift_held:
+                                time.sleep(0.05)
+                                pyautogui.press("enter")
+                        threading.Thread(target=_do_paste, daemon=True).start()
 
                     _shift_state = [False]
 
@@ -1212,18 +1309,21 @@ class WhisperTray:
                         elif e.name in ("left", "up"):
                             self.bubble.debug_navigate(-1)
                         elif e.name == "enter":
+                            self._cleanup_nav_hooks_async()
                             self.bubble.debug_confirm(shift_held=_shift_state[0])
                         elif e.name == "esc":
-                            _cleanup_hooks()
+                            self._cleanup_nav_hooks_async()
                             self.bubble.debug_dismiss()
 
-                    nav_hooks.append(kb.hook(_on_nav_key, suppress=True))
+                    self._nav_hooks = [kb.hook(_on_nav_key, suppress=True)]
                     self.bubble._on_select = _on_debug_select
                     self.play_chime(CHIME_DONE)
                     original_display = f"{detected_tone} {raw_text}" if detected_tone else raw_text
                     self.bubble.show(None, style="debug", original=original_display, debug_results=all_results)
                 elif self._llm_cleanup:
+                    log.debug("cleanup_text START (single-model)")
                     cleaned = self.cleanup_text(raw_text)
+                    log.debug(f"cleanup_text DONE: '{cleaned[:80] if cleaned else ''}'")
                     if cleaned != raw_text:
                         print(f"[LLM  ] {cleaned}")
                     final_text = cleaned
@@ -1244,8 +1344,10 @@ class WhisperTray:
                         if tone_emoji:
                             final_text = f"{tone_emoji} {final_text}"
                             print(f"[TONE ] {tone_emoji}")
+                    log.debug("paste_text START (single-model)"); sys.stdout.flush()
                     self.play_chime(CHIME_DONE)
                     self.paste_text(final_text)
+                    log.debug("paste_text DONE"); sys.stdout.flush()
                     if final_text != raw_text and self._bubble_duration > 0:
                         self.bubble.show(final_text, style="compare", duration=self._bubble_duration, original=raw_text)
                     elif self._bubble_duration > 0:
@@ -1271,7 +1373,9 @@ class WhisperTray:
             else:
                 print("[EMPTY] Nothing transcribed.")
                 self.bubble.show("(nothing heard)", style="transcribing", duration=1.5)
+            log.debug("_do_transcribe: set_icon READY"); sys.stdout.flush()
             self.set_icon(self.COLOR_READY)
+            log.debug("_do_transcribe DONE"); sys.stdout.flush()
 
         threading.Thread(target=_do_transcribe, daemon=True).start()
 
@@ -1294,6 +1398,22 @@ class WhisperTray:
             keyboard.on_press_key(self._hotkey, lambda e: self.on_key_down(), suppress=False)
             keyboard.on_release_key(self._hotkey, lambda e: self.on_key_up(), suppress=False)
             self._chord_trigger_key = None
+        # Register Escape to cancel recording (always active, gated by is_recording)
+        keyboard.on_press_key("esc", lambda e: self._cancel_recording(), suppress=False)
+
+    def _cleanup_nav_hooks_async(self):
+        """Clean up multi-model nav hooks off the keyboard thread to avoid deadlock."""
+        hooks = list(getattr(self, '_nav_hooks', []))
+        self._nav_hooks = []
+        if hooks:
+            def _do():
+                import keyboard as kb
+                for h in hooks:
+                    try:
+                        kb.unhook(h)
+                    except (ValueError, KeyError):
+                        pass
+            threading.Thread(target=_do, daemon=True, name="unhook-nav").start()
 
     def _chord_release_check(self):
         """For chord hotkeys, trigger on_key_up when the trigger key is released."""
@@ -1335,9 +1455,7 @@ class WhisperTray:
     def _get_installed_models(self):
         """Query Ollama for locally available models."""
         try:
-            req = urllib.request.Request(f"{OLLAMA_URL}/api/tags")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = self._ollama_get("/api/tags")
             return [m["name"] for m in data.get("models", [])]
         except Exception:
             return []
@@ -1387,25 +1505,41 @@ class WhisperTray:
     def _unload_ollama_model(self):
         """Tell Ollama to unload the current model from memory."""
         try:
-            payload = json.dumps({
+            self._ollama_post("/api/generate", {
                 "model": self._llm_model,
                 "keep_alive": 0,
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                f"{OLLAMA_URL}/api/generate",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(req, timeout=3)
+                "stream": False,
+            }, timeout=5)
             print(f"[LLM  ] Unloaded {self._llm_model} from memory")
         except Exception as e:
             print(f"[LLM  ] Failed to unload model: {e}")
+
+    def _warm_ollama_model(self):
+        """Pre-load the Ollama model into memory so the first real call is fast."""
+        log.debug("_warm_ollama_model START")
+        self._ollama_ready.clear()
+        self.bubble.show(f"Loading {self._llm_model}...", style="transcribing")
+        try:
+            log.debug("_warm_ollama_model: calling ollama...")
+            self._call_ollama("Hello")
+            log.debug("_warm_ollama_model: DONE")
+            print(f"[LLM  ] Model {self._llm_model} warmed up.")
+            self.bubble.show(f"{self._llm_model} ready!", style="result", duration=3)
+        except Exception as e:
+            log.error(f"_warm_ollama_model FAILED: {e}")
+            print(f"[LLM  ] Warm-up failed: {e}")
+            self.bubble.show(f"LLM unavailable: {e}", style="transcribing", duration=3)
+        finally:
+            log.debug("_warm_ollama_model: setting ollama_ready")
+            self._ollama_ready.set()
 
     def _toggle_llm_cleanup(self):
         self._llm_cleanup = not self._llm_cleanup
         state = "on" if self._llm_cleanup else "off"
         print(f"[LLM  ] Text cleanup {state}")
-        if not self._llm_cleanup:
+        if self._llm_cleanup:
+            threading.Thread(target=self._warm_ollama_model, daemon=True).start()
+        else:
             threading.Thread(target=self._unload_ollama_model, daemon=True).start()
         self._save_config()
         self._rebuild_tray_menu()
@@ -1548,12 +1682,14 @@ class WhisperTray:
             privacy_var = tk.BooleanVar(value=self._privacy_mic)
             def _on_privacy():
                 self._privacy_mic = privacy_var.get()
-                if self._privacy_mic:
-                    self._close_audio_stream()
-                    print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
-                else:
-                    self._open_audio_stream()
-                    print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
+                def _do():
+                    if self._privacy_mic:
+                        self._close_audio_stream()
+                        print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
+                    else:
+                        self._open_audio_stream()
+                        print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
+                threading.Thread(target=_do, daemon=True).start()
                 self._save_config()
             add_toggle(left, "Privacy mic (open only while recording)", privacy_var, 3, _on_privacy)
 
@@ -1618,6 +1754,10 @@ class WhisperTray:
             llm_var = tk.BooleanVar(value=self._llm_cleanup)
             def _on_llm():
                 self._llm_cleanup = llm_var.get()
+                if self._llm_cleanup:
+                    threading.Thread(target=self._warm_ollama_model, daemon=True).start()
+                else:
+                    threading.Thread(target=self._unload_ollama_model, daemon=True).start()
                 self._save_config()
                 self._rebuild_tray_menu()
             add_toggle(right, "Enable LLM cleanup", llm_var, 1, _on_llm)
@@ -1757,6 +1897,13 @@ class WhisperTray:
         else:
             print(f"[CPU  ] No CUDA detected, using CPU.")
 
+        ollama_parallel = os.environ.get("OLLAMA_NUM_PARALLEL", "")
+        if not ollama_parallel:
+            print(f"[TIP  ] Set OLLAMA_NUM_PARALLEL=4 as a system env var and restart Ollama")
+            print(f"[TIP  ] for faster Multi-Model Preview (parallel LLM inference).")
+        else:
+            print(f"[LLM  ] OLLAMA_NUM_PARALLEL={ollama_parallel}")
+
         self.load_model()
 
         # Start overlay bubble with live FFT feed
@@ -1772,6 +1919,10 @@ class WhisperTray:
         else:
             self._open_audio_stream()
             print(f"[MIC  ] Always-on mic stream started.")
+
+        # Pre-warm Ollama model if LLM cleanup is enabled
+        if self._llm_cleanup:
+            threading.Thread(target=self._warm_ollama_model, daemon=True).start()
 
         # Start hotkey listener in background thread
         hotkey_thread = threading.Thread(target=self.hotkey_loop, daemon=True)
