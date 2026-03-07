@@ -359,6 +359,7 @@ class WhisperTray:
         # Streaming transcription state
         self._stream_text = ""
         self._stream_lock = threading.Lock()
+        self._icon_lock = threading.Lock()
 
     @property
     def _device(self):
@@ -451,7 +452,14 @@ class WhisperTray:
 
     def set_icon(self, color):
         if self.tray:
-            self.tray.icon = make_icon_image(color)
+            if not self._icon_lock.acquire(timeout=2):
+                return
+            try:
+                self.tray.icon = make_icon_image(color)
+            except (PermissionError, OSError):
+                pass
+            finally:
+                self._icon_lock.release()
 
     def _open_audio_stream(self):
         """Open the microphone input stream."""
@@ -471,7 +479,7 @@ class WhisperTray:
         if self.stream is None:
             return
         try:
-            self.stream.stop()
+            self.stream.abort()
             self.stream.close()
         except Exception:
             pass
@@ -514,7 +522,10 @@ class WhisperTray:
             tmp_path = f.name
         try:
             self.write_wav(tmp_path, audio_np)
-            segments, _ = self.model.transcribe(tmp_path, beam_size=5)
+            lang = "en" if WHISPER_MODEL.endswith(".en") else None
+            segments, _ = self.model.transcribe(
+                tmp_path, beam_size=3, language=lang, vad_filter=True,
+            )
             text = " ".join(s.text.strip() for s in segments).strip()
         finally:
             os.unlink(tmp_path)
@@ -526,7 +537,10 @@ class WhisperTray:
             tmp_path = f.name
         try:
             self.write_wav(tmp_path, audio_np)
-            segments, _ = self.model.transcribe(tmp_path, beam_size=5)
+            lang = "en" if WHISPER_MODEL.endswith(".en") else None
+            segments, _ = self.model.transcribe(
+                tmp_path, beam_size=3, language=lang, vad_filter=True,
+            )
             parts = []
             for seg in segments:
                 parts.append(seg.text.strip())
@@ -555,21 +569,30 @@ class WhisperTray:
     def on_key_down(self):
         if self.is_recording:
             return
-        if self._privacy_mic:
-            self._open_audio_stream()
         self.is_recording = True
-        self.audio_buffer.clear()
-        self._viz_buffer[:] = 0
-        self._stream_text = ""
-        self.start_time = time.time()
-        self.set_icon(self.COLOR_RECORDING)
-        self.bubble.show("Recording...", style="recording")
-        self.play_chime(CHIME_START)
+        threading.Thread(target=self._do_key_down, daemon=True, name="key-down").start()
+
+    def _do_key_down(self):
+        try:
+            if self._privacy_mic:
+                self._open_audio_stream()
+            self.audio_buffer.clear()
+            self._viz_buffer[:] = 0
+            self._stream_text = ""
+            self.start_time = time.time()
+            self.set_icon(self.COLOR_RECORDING)
+            self.bubble.show("Recording...", style="recording")
+            self.play_chime(CHIME_START)
+        except Exception:
+            self.is_recording = False
 
     def on_key_up(self):
         if not self.is_recording:
             return
         self.is_recording = False
+        threading.Thread(target=self._do_key_up, daemon=True, name="key-up").start()
+
+    def _do_key_up(self):
         if self._privacy_mic:
             self._close_audio_stream()
         elapsed = time.time() - self.start_time
@@ -659,12 +682,14 @@ class WhisperTray:
 
     def _toggle_privacy_mic(self):
         self._privacy_mic = not self._privacy_mic
-        if self._privacy_mic:
-            self._close_audio_stream()
-            print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
-        else:
-            self._open_audio_stream()
-            print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
+        def _do():
+            if self._privacy_mic:
+                self._close_audio_stream()
+                print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
+            else:
+                self._open_audio_stream()
+                print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
+        threading.Thread(target=_do, daemon=True).start()
         self._rebuild_tray_menu()
 
     # -- Tray ----------------------------------
