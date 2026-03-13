@@ -243,36 +243,180 @@ def make_icon_image(color):
     return img
 
 
-def draw_waveform(size=96, color="#F44336", bar_heights=None):
-    """Draw waveform equalizer bars and return a Pillow RGBA Image."""
-    from PIL import Image, ImageDraw
+def _get_windows_accent_color():
+    """Read the Windows theme accent color from the registry. Returns (r, g, b)."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM")
+        val, _ = winreg.QueryValueEx(key, "AccentColor")
+        winreg.CloseKey(key)
+        # AccentColor is stored as ABGR DWORD
+        r = val & 0xFF
+        g = (val >> 8) & 0xFF
+        b = (val >> 16) & 0xFF
+        return (r, g, b)
+    except Exception:
+        return (100, 140, 230)  # fallback soft blue
 
+
+# Cache the accent color at import time (avoids registry reads every frame)
+_ACCENT_RGB = _get_windows_accent_color()
+
+
+def draw_waveform(size=70, color=None, bar_heights=None, style="Bars"):
+    """Draw FFT inside a glassy pill capsule, tinted with Windows accent color.
+
+    style: "Bars" for discrete rounded bars, "Wave" for smooth filled waveform.
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+    import colorsys
+
+    W, H = int(size * 2.6), size  # wide capsule aspect ratio
     if bar_heights is None:
-        bar_heights = [0.3, 0.6, 0.9, 0.6, 0.3]
+        bar_heights = [0.15] * NUM_BARS
 
-    num_bars = len(bar_heights)
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ar, ag, ab = _ACCENT_RGB
+    # Derive accent hue for color variations
+    ah, as_, av = colorsys.rgb_to_hsv(ar / 255, ag / 255, ab / 255)
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    padding = size * 0.15
-    usable_w = size - 2 * padding
-    gap_ratio = 0.4
-    bar_w = usable_w / (num_bars + (num_bars - 1) * gap_ratio)
-    gap = bar_w * gap_ratio
-    max_h = size * 0.70
-    cy = size / 2
-    radius = bar_w / 2
+    # --- Pill capsule shell ---
+    border = 2
+    radius = H // 2
 
-    for i, h in enumerate(bar_heights):
-        x = padding + i * (bar_w + gap)
-        bar_h = max(bar_w, max_h * h)
-        top = cy - bar_h / 2
-        bot = cy + bar_h / 2
-        draw.rounded_rectangle(
-            [x, top, x + bar_w, bot],
-            radius=radius,
-            fill=color,
-        )
+    # Outer glow tinted with accent
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow)
+    glow_draw.rounded_rectangle(
+        [0, 0, W - 1, H - 1], radius=radius,
+        fill=(ar, ag, ab, 25),
+    )
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=5))
+    img = Image.alpha_composite(img, glow)
+    draw = ImageDraw.Draw(img)
+
+    # Capsule border (subtle, accent-tinted)
+    br = int(200 + (ar - 128) * 0.2)
+    bg_ = int(200 + (ag - 128) * 0.2)
+    bb = int(200 + (ab - 128) * 0.2)
+    draw.rounded_rectangle(
+        [0, 0, W - 1, H - 1], radius=radius,
+        fill=(min(235, br), min(235, bg_), min(235, bb), 160),
+        outline=(min(210, br - 20), min(210, bg_ - 20), min(210, bb - 20), 180), width=2,
+    )
+
+    # Inner capsule fill (dark translucent)
+    inner_margin = border + 2
+    draw.rounded_rectangle(
+        [inner_margin, inner_margin, W - 1 - inner_margin, H - 1 - inner_margin],
+        radius=radius - inner_margin,
+        fill=(12, 14, 22, 210),
+    )
+
+    # Glass highlight on top edge
+    highlight = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    hl_draw = ImageDraw.Draw(highlight)
+    hl_draw.rounded_rectangle(
+        [inner_margin + 3, inner_margin + 1,
+         W - 1 - inner_margin - 3, H // 3],
+        radius=(radius - inner_margin) // 2,
+        fill=(255, 255, 255, 22),
+    )
+    highlight = highlight.filter(ImageFilter.GaussianBlur(radius=2))
+    img = Image.alpha_composite(img, highlight)
+    draw = ImageDraw.Draw(img)
+
+    # --- FFT content (mirrored from center) ---
+    pad_x = int(W * 0.08)
+    wave_w = W - 2 * pad_x
+    cy = H // 2
+    half_max = int(H * 0.38)
+    num_bars = len(bar_heights)
+
+    if style == "Bars":
+        # Discrete rounded bars
+        gap_ratio = 0.35
+        bar_w = wave_w / (num_bars + (num_bars - 1) * gap_ratio)
+        gap = bar_w * gap_ratio
+        bar_radius = max(2, int(bar_w / 3))
+
+        for i, bh in enumerate(bar_heights):
+            t = (i + 0.5) / num_bars
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            edge_dim = 1.0 - 0.15 * abs(t - 0.5) * 2
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.9), min(1.0, av * edge_dim))
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+
+            col_h = max(3, int(half_max * max(0.05, bh)))
+            x = pad_x + i * (bar_w + gap)
+            draw.rounded_rectangle(
+                [x, cy - col_h, x + bar_w, cy + col_h],
+                radius=bar_radius,
+                fill=(r, g, b, 230),
+            )
+
+        # Bar glow
+        bar_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        bg_draw = ImageDraw.Draw(bar_glow)
+        for i, bh in enumerate(bar_heights):
+            t = (i + 0.5) / num_bars
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.7), 1.0)
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+            col_h = max(3, int(half_max * max(0.05, bh)))
+            x = pad_x + i * (bar_w + gap) + bar_w / 2
+            bg_draw.ellipse([x - 3, cy - col_h - 3, x + 3, cy - col_h + 3], fill=(r, g, b, 70))
+            bg_draw.ellipse([x - 3, cy + col_h - 3, x + 3, cy + col_h + 3], fill=(r, g, b, 70))
+        bar_glow = bar_glow.filter(ImageFilter.GaussianBlur(radius=3))
+        img = Image.alpha_composite(img, bar_glow)
+
+    else:
+        # Smooth wave: interpolate bar heights to per-pixel curve
+        heights_px = []
+        for px in range(wave_w):
+            t = px / max(wave_w - 1, 1) * (num_bars - 1)
+            idx = int(t)
+            frac = t - idx
+            if idx >= num_bars - 1:
+                h = bar_heights[-1]
+            else:
+                h = bar_heights[idx] * (1 - frac) + bar_heights[idx + 1] * frac
+            heights_px.append(max(0.05, h))
+
+        for px in range(wave_w):
+            t = px / max(wave_w - 1, 1)
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            edge_dim = 1.0 - 0.15 * abs(t - 0.5) * 2
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.9), min(1.0, av * edge_dim))
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+
+            col_h = int(half_max * heights_px[px])
+            x = pad_x + px
+            for y in range(cy - col_h, cy + col_h + 1):
+                dist = abs(y - cy) / max(col_h, 1)
+                alpha = int(160 + 95 * dist)
+                img.putpixel((x, y), (r, g, b, min(255, alpha)))
+
+        # Wave glow on peaks
+        wave_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        wg_draw = ImageDraw.Draw(wave_glow)
+        for px in range(0, wave_w, 3):
+            t = px / max(wave_w - 1, 1)
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.7), 1.0)
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+            col_h = int(half_max * heights_px[px])
+            x = pad_x + px
+            wg_draw.ellipse([x - 2, cy - col_h - 2, x + 2, cy - col_h + 2], fill=(r, g, b, 80))
+            wg_draw.ellipse([x - 2, cy + col_h - 2, x + 2, cy + col_h + 2], fill=(r, g, b, 80))
+        wave_glow = wave_glow.filter(ImageFilter.GaussianBlur(radius=3))
+        img = Image.alpha_composite(img, wave_glow)
 
     return img
 
@@ -283,17 +427,18 @@ def draw_waveform(size=96, color="#F44336", bar_heights=None):
 class Bubble:
     """A small popup at bottom-center of the screen."""
 
+    _accent_hex = "#{:02x}{:02x}{:02x}".format(*_ACCENT_RGB)
     COLORS = {
-        "recording":    {"bg": "#F44336", "fg": "#FFFFFF"},
-        "transcribing": {"bg": "#FFC107", "fg": "#000000"},
-        "result":       {"bg": "#4CAF50", "fg": "#FFFFFF"},
+        "recording":    {"bg": _accent_hex, "fg": "#FFFFFF"},
+        "transcribing": {"bg": _accent_hex, "fg": "#FFFFFF"},
+        "result":       {"bg": _accent_hex, "fg": "#FFFFFF"},
     }
 
     FADE_STEPS  = 12
     FADE_MS     = 16
     MAX_ALPHA   = 0.92
     TRANSPARENT = "#010101"
-    MIC_SIZE    = 120
+    MIC_SIZE    = 55
 
     def __init__(self, fft_callback=None):
         self._root = None
@@ -317,7 +462,8 @@ class Bubble:
 
     def _build_waveform_photo(self, color_hex, bar_heights=None):
         from PIL import ImageTk
-        pil_img = draw_waveform(size=self.MIC_SIZE, color=color_hex, bar_heights=bar_heights)
+        pil_img = draw_waveform(size=self.MIC_SIZE, color=color_hex, bar_heights=bar_heights,
+                                style=getattr(self, "waveform_style", "Bars"))
         photo = ImageTk.PhotoImage(pil_img)
         return photo
 
@@ -400,7 +546,7 @@ class Bubble:
             "Emoji": "#FFEE58",          # yellow
         }
 
-        self._mic_images["result"] = self._build_waveform_photo("#4CAF50")
+        self._mic_images["result"] = self._build_waveform_photo(self._accent_hex)
 
         self._screen_w = self._root.winfo_screenwidth()
         self._screen_h = self._root.winfo_screenheight()
@@ -475,6 +621,10 @@ class Bubble:
             self._timer_label.pack_forget()
             self._compare_frame.pack_forget()
             self._debug_frame.pack_forget()
+
+            # For recording/transcribing styles, always pack both mic + timer
+            # to keep layout stable (timer text is cleared when not recording)
+            _is_waveform_style = style in ("recording", "transcribing")
 
             if style == "debug" and debug_results is not None:
                 # Show original + all 3 prompt results as clickable columns
@@ -566,7 +716,7 @@ class Bubble:
 
                 self._orig_label.config(text=original, bg="#333333", fg="#AAAAAA")
                 self._arrow_label.config(bg=self.TRANSPARENT, fg="#FFFFFF")
-                self._clean_label.config(text=text, bg="#333333", fg="#4CAF50")
+                self._clean_label.config(text=text, bg="#333333", fg=self._accent_hex)
 
                 self._orig_label.pack(side="left", padx=(8, 0), pady=4)
                 self._arrow_label.pack(side="left", padx=4, pady=4)
@@ -591,9 +741,12 @@ class Bubble:
                 color = self.COLORS[style]["bg"]
                 self._mic_label.config(bg=self.TRANSPARENT)
                 self._mic_label.pack()
+                # Always pack timer to prevent layout shift; hide text when not recording
                 if style == "recording":
                     self._timer_label.config(text="0:00", fg=color, bg=self.TRANSPARENT)
-                    self._timer_label.pack()
+                else:
+                    self._timer_label.config(text=" ", fg=self.TRANSPARENT, bg=self.TRANSPARENT)
+                self._timer_label.pack()
                 self._start_live_fft(color)
 
             self._position_bottom_center()
@@ -688,6 +841,7 @@ class WhisperTray:
         # Device management
         self._cuda_available = detect_cuda()
         self._use_cuda = self._cuda_available  # default to GPU if available
+        self._cuda_verified = False  # cached CUDA test result
         self._hotkey = HOTKEY
         self._chime_enabled = False
         self._llm_cleanup = LLM_CLEANUP
@@ -701,6 +855,7 @@ class WhisperTray:
         self._translate_lang = None  # None = off, "Spanish" etc = on
         self._bubble_duration = BUBBLE_DURATION
         self._privacy_mic = PRIVACY_MIC
+        self._waveform_style = "Bars"  # "Bars" or "Wave"
         self._cancel_requested = False
         self._recording_timer = None
         # History log
@@ -739,11 +894,13 @@ class WhisperTray:
             self._translate_lang = cfg.get("translate_lang", self._translate_lang)
             self._bubble_duration = cfg.get("bubble_duration", self._bubble_duration)
             self._privacy_mic = cfg.get("privacy_mic", self._privacy_mic)
+            self._waveform_style = cfg.get("waveform_style", self._waveform_style)
             # Load custom prompts into LLM_PROMPTS
             for name, template in cfg.get("custom_prompts", {}).items():
                 LLM_PROMPTS[name] = template
             if self._cuda_available:
                 self._use_cuda = cfg.get("use_cuda", self._use_cuda)
+            self._cuda_verified = cfg.get("cuda_verified", False)
             # Validate llm_prompt still exists
             if self._llm_prompt not in LLM_PROMPTS:
                 self._llm_prompt = LLM_DEFAULT_PROMPT
@@ -770,6 +927,8 @@ class WhisperTray:
             "translate_lang": self._translate_lang,
             "bubble_duration": self._bubble_duration,
             "privacy_mic": self._privacy_mic,
+            "waveform_style": self._waveform_style,
+            "cuda_verified": getattr(self, "_cuda_verified", False),
         }
         # Preserve custom_prompts if they exist in the file
         try:
@@ -851,12 +1010,20 @@ class WhisperTray:
         from faster_whisper import WhisperModel
 
         if self._use_cuda:
-            print(f"[INIT ] CUDA detected, testing GPU inference...")
-            if self._test_cuda_inference():
-                print(f"[GPU  ] CUDA test passed.")
+            # Skip CUDA subprocess test if it passed before (cached in config)
+            if getattr(self, "_cuda_verified", False):
+                print(f"[GPU  ] CUDA previously verified, skipping test.")
             else:
-                print(f"[WARN ] CUDA test failed or timed out, using CPU instead.")
-                self._use_cuda = False
+                print(f"[INIT ] CUDA detected, testing GPU inference...")
+                if self._test_cuda_inference():
+                    print(f"[GPU  ] CUDA test passed.")
+                    self._cuda_verified = True
+                    self._save_config()
+                else:
+                    print(f"[WARN ] CUDA test failed or timed out, using CPU instead.")
+                    self._use_cuda = False
+                    self._cuda_verified = False
+                    self._save_config()
 
         device = self._device
         compute = self._compute_type
@@ -867,6 +1034,8 @@ class WhisperTray:
             if device == "cuda":
                 print(f"[WARN ] CUDA failed ({e}), falling back to CPU...")
                 self._use_cuda = False
+                self._cuda_verified = False
+                self._save_config()
                 self.model = WhisperModel(self._whisper_model, device="cpu", compute_type="int8")
             else:
                 raise
@@ -1431,7 +1600,57 @@ class WhisperTray:
 
     def hotkey_loop(self):
         self._register_hotkey()
+        self._start_session_watchdog()
         self._stop_event.wait()
+
+    def _start_session_watchdog(self):
+        """Watch for Windows session lock/unlock and re-register hooks on unlock."""
+        def _watchdog():
+            import ctypes
+            import ctypes.wintypes
+            user32 = ctypes.windll.user32
+            # Proper 64-bit handle types for Win32 API
+            user32.OpenInputDesktop.restype = ctypes.wintypes.HDESK
+            user32.CloseDesktop.argtypes = [ctypes.wintypes.HDESK]
+            DESKTOP_READOBJECTS = 0x0001
+            locked_count = 0       # debounce: require consecutive failures
+            LOCK_THRESHOLD = 3     # must fail 3 polls (~6s) to count as locked
+            was_locked = False
+            while not self._stop_event.is_set():
+                self._stop_event.wait(2)
+                if self._stop_event.is_set():
+                    break
+                try:
+                    hDesk = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+                except Exception:
+                    locked_count += 1
+                    continue
+                if hDesk:
+                    user32.CloseDesktop(hDesk)
+                    if was_locked:
+                        was_locked = False
+                        locked_count = 0
+                        # Don't rehook mid-recording
+                        if self.is_recording:
+                            print("[HOOK ] Session unlocked mid-recording, deferring rehook.")
+                            continue
+                        print("[HOOK ] Session unlocked — re-registering keyboard hooks.")
+                        try:
+                            self._unregister_hotkey()
+                        except Exception:
+                            pass
+                        try:
+                            self._register_hotkey()
+                        except Exception as e:
+                            print(f"[HOOK ] Failed to re-register hooks: {e}")
+                    else:
+                        locked_count = 0
+                else:
+                    locked_count += 1
+                    if not was_locked and locked_count >= LOCK_THRESHOLD:
+                        was_locked = True
+                        print("[HOOK ] Session appears locked.")
+        threading.Thread(target=_watchdog, daemon=True, name="session-watchdog").start()
 
     # -- Device toggle -------------------------
 
@@ -1624,57 +1843,96 @@ class WhisperTray:
             self._settings_win = win
             win.title("Whisper STT Settings")
             win.attributes("-topmost", True)
-            win.configure(bg="#1e1e1e")
             win.resizable(False, False)
 
-            # Styling helpers
+            # --- Theme ---
+            BG = "#16171c"
+            CARD = "#1e2028"
+            CARD_BORDER = "#2a2c36"
+            FG = "#d4d6de"
+            FG_DIM = "#808494"
+            ACCENT = Bubble._accent_hex
+            FIELD_BG = "#282a34"
+            HOVER = "#32343e"
             FONT = ("Segoe UI", 10)
             FONT_BOLD = ("Segoe UI", 10, "bold")
-            FONT_HEADER = ("Segoe UI", 12, "bold")
-            BG = "#1e1e1e"
-            FG = "#e0e0e0"
-            SEC_BG = "#2a2a2a"
-            ACCENT = "#4CAF50"
+            FONT_HEADER = ("Segoe UI", 11, "bold")
+            FONT_TITLE = ("Segoe UI", 14, "bold")
 
-            def section_header(parent, text, row):
-                tk.Label(parent, text=text, font=FONT_HEADER, bg=BG, fg=ACCENT,
-                         anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
+            win.configure(bg=BG)
 
-            def add_toggle(parent, label, var, row, command=None):
-                cb = tk.Checkbutton(parent, text=label, variable=var, font=FONT,
-                                    bg=BG, fg=FG, selectcolor="#333333", activebackground=BG,
-                                    activeforeground=FG, anchor="w", command=command)
-                cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=2)
+            # --- Title bar area ---
+            title_frame = tk.Frame(win, bg=BG)
+            title_frame.pack(fill="x", padx=20, pady=(16, 4))
+            tk.Label(title_frame, text="Settings", font=FONT_TITLE, bg=BG, fg=FG,
+                     anchor="w").pack(side="left")
+            tk.Label(title_frame, text="Whisper STT", font=FONT, bg=BG, fg=FG_DIM,
+                     anchor="e").pack(side="right")
+
+            # Accent divider line
+            div = tk.Frame(win, bg=ACCENT, height=2)
+            div.pack(fill="x", padx=20, pady=(0, 8))
+
+            # --- Helpers ---
+            def make_card(parent):
+                """Create a rounded-looking card frame."""
+                card = tk.Frame(parent, bg=CARD, highlightbackground=CARD_BORDER,
+                                highlightthickness=1, padx=14, pady=10)
+                return card
+
+            def section_label(parent, text):
+                tk.Label(parent, text=text, font=FONT_HEADER, bg=CARD, fg=ACCENT,
+                         anchor="w").pack(fill="x", pady=(0, 6))
+
+            def add_toggle(parent, label, var, command=None):
+                f = tk.Frame(parent, bg=CARD)
+                f.pack(fill="x", pady=2)
+                cb = tk.Checkbutton(f, text=label, variable=var, font=FONT,
+                                    bg=CARD, fg=FG, selectcolor=FIELD_BG,
+                                    activebackground=CARD, activeforeground=FG,
+                                    anchor="w", command=command)
+                cb.pack(side="left")
                 return cb
 
-            def add_dropdown(parent, label, var, options, row, command=None):
-                tk.Label(parent, text=label, font=FONT, bg=BG, fg=FG,
-                         anchor="w").grid(row=row, column=0, sticky="w", padx=20, pady=2)
-                om = tk.OptionMenu(parent, var, *options, command=command)
-                om.config(font=FONT, bg="#333333", fg=FG, activebackground="#444444",
-                          activeforeground=FG, highlightthickness=0)
-                om["menu"].config(bg="#333333", fg=FG, font=FONT)
-                om.grid(row=row, column=1, sticky="w", padx=8, pady=2)
+            def add_dropdown(parent, label, var, options, command=None):
+                f = tk.Frame(parent, bg=CARD)
+                f.pack(fill="x", pady=2)
+                tk.Label(f, text=label, font=FONT, bg=CARD, fg=FG,
+                         anchor="w").pack(side="left")
+                om = tk.OptionMenu(f, var, *options, command=command)
+                om.config(font=FONT, bg=FIELD_BG, fg=FG, activebackground=HOVER,
+                          activeforeground=FG, highlightthickness=0, relief="flat",
+                          borderwidth=1)
+                om["menu"].config(bg=FIELD_BG, fg=FG, font=FONT,
+                                  activebackground=ACCENT, activeforeground="#FFFFFF",
+                                  borderwidth=0)
+                om.pack(side="right")
                 return om
 
-            columns_frame = tk.Frame(win, bg=BG)
-            columns_frame.pack(fill="both", expand=True, padx=8, pady=4)
+            # --- Two-column layout ---
+            columns = tk.Frame(win, bg=BG)
+            columns.pack(fill="both", expand=True, padx=16, pady=4)
+            columns.columnconfigure(0, weight=1)
+            columns.columnconfigure(1, weight=1)
 
-            # ── Left column: Recording, Whisper, Translation, History ──
-            left = tk.Frame(columns_frame, bg=BG)
-            left.grid(row=0, column=0, sticky="n", padx=(0, 12))
+            # ══════════ LEFT COLUMN ══════════
+            left = tk.Frame(columns, bg=BG)
+            left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
-            section_header(left, "Recording", 0)
+            # -- Recording card --
+            rec_card = make_card(left)
+            rec_card.pack(fill="x", pady=(0, 8))
+            section_label(rec_card, "Recording")
 
             hotkey_var = tk.StringVar(value=self._hotkey)
-            add_dropdown(left, "Hotkey:", hotkey_var, HOTKEY_OPTIONS, 1,
+            add_dropdown(rec_card, "Hotkey", hotkey_var, HOTKEY_OPTIONS,
                          command=lambda v: self.change_hotkey(v))
 
             chime_var = tk.BooleanVar(value=self._chime_enabled)
             def _on_chime():
                 self._chime_enabled = chime_var.get()
                 self._save_config()
-            add_toggle(left, "Sound chimes", chime_var, 2, _on_chime)
+            add_toggle(rec_card, "Sound chimes", chime_var, _on_chime)
 
             privacy_var = tk.BooleanVar(value=self._privacy_mic)
             def _on_privacy():
@@ -1682,71 +1940,83 @@ class WhisperTray:
                 def _do():
                     if self._privacy_mic:
                         self._close_audio_stream()
-                        print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
+                        print("[MIC  ] Privacy mic mode enabled.")
                     else:
                         self._open_audio_stream()
-                        print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
+                        print("[MIC  ] Privacy mic mode disabled.")
                 threading.Thread(target=_do, daemon=True).start()
                 self._save_config()
-            add_toggle(left, "Privacy mic (open only while recording)", privacy_var, 3, _on_privacy)
+            add_toggle(rec_card, "Privacy mic", privacy_var, _on_privacy)
 
             bubble_dur_var = tk.StringVar(value=str(self._bubble_duration))
-            bubble_options = ["0", "1", "2", "3", "4", "5", "7", "10"]
             def _on_bubble_dur(v):
                 self._bubble_duration = int(v)
                 self._save_config()
-            add_dropdown(left, "Bubble duration (s):", bubble_dur_var, bubble_options, 4,
+            add_dropdown(rec_card, "Bubble duration (s)", bubble_dur_var,
+                         ["0", "1", "2", "3", "4", "5", "7", "10"],
                          command=_on_bubble_dur)
 
-            section_header(left, "Whisper Model", 5)
+            wave_style_var = tk.StringVar(value=self._waveform_style)
+            def _on_wave_style(v):
+                self._waveform_style = v
+                self.bubble.waveform_style = v
+                self._save_config()
+            add_dropdown(rec_card, "Visualizer", wave_style_var,
+                         ["Bars", "Wave"], command=_on_wave_style)
+
+            # -- Model card --
+            model_card = make_card(left)
+            model_card.pack(fill="x", pady=(0, 8))
+            section_label(model_card, "Whisper Model")
 
             whisper_var = tk.StringVar(value=self._whisper_model)
-            add_dropdown(left, "Model:", whisper_var, WHISPER_MODEL_OPTIONS, 6,
+            add_dropdown(model_card, "Model", whisper_var, WHISPER_MODEL_OPTIONS,
                          command=lambda v: self._set_whisper_model(v))
 
-            lr = 7
             if self._cuda_available:
                 cuda_var = tk.BooleanVar(value=self._use_cuda)
                 def _on_cuda():
                     self._use_cuda = cuda_var.get()
+                    self._cuda_verified = False  # re-test on next cold boot
                     self._save_config()
                     threading.Thread(target=self.reload_model, daemon=True).start()
-                add_toggle(left, "Use GPU (CUDA)", cuda_var, lr, _on_cuda)
-                lr += 1
+                add_toggle(model_card, "Use GPU (CUDA)", cuda_var, _on_cuda)
 
-            section_header(left, "Translation", lr)
-            lr += 1
+            # -- Translation card --
+            trans_card = make_card(left)
+            trans_card.pack(fill="x", pady=(0, 8))
+            section_label(trans_card, "Translation")
 
-            trans_options = ["Off"] + TRANSLATE_LANGS
             trans_var = tk.StringVar(value=self._translate_lang or "Off")
             def _on_translate(v):
                 self._set_translate_lang(None if v == "Off" else v)
-            add_dropdown(left, "Translate to:", trans_var, trans_options, lr,
-                         command=_on_translate)
-            lr += 1
+            add_dropdown(trans_card, "Translate to", trans_var,
+                         ["Off"] + TRANSLATE_LANGS, command=_on_translate)
 
-            section_header(left, "History", lr)
-            lr += 1
+            # -- History card --
+            hist_card = make_card(left)
+            hist_card.pack(fill="x", pady=(0, 8))
+            section_label(hist_card, "History")
 
-            hist_frame = tk.Frame(left, bg=BG)
-            hist_frame.grid(row=lr, column=0, columnspan=2, sticky="w", padx=20, pady=4)
+            hist_row = tk.Frame(hist_card, bg=CARD)
+            hist_row.pack(fill="x")
+            tk.Label(hist_row, text=f"{len(self._history)} entries", font=FONT,
+                     bg=CARD, fg=FG_DIM).pack(side="left")
+            for btn_text, btn_cmd in [("Clear", self._clear_history), ("Open", self._open_history)]:
+                b = tk.Button(hist_row, text=btn_text, font=FONT, bg=FIELD_BG, fg=FG,
+                              activebackground=HOVER, activeforeground=FG,
+                              relief="flat", borderwidth=0, padx=10, pady=2,
+                              command=btn_cmd)
+                b.pack(side="right", padx=(4, 0))
 
-            tk.Label(hist_frame, text=f"{len(self._history)} entries", font=FONT,
-                     bg=BG, fg=FG).pack(side="left", padx=(0, 12))
-            tk.Button(hist_frame, text="Open", font=FONT, bg="#333333", fg=FG,
-                      command=self._open_history).pack(side="left", padx=4)
-            tk.Button(hist_frame, text="Clear", font=FONT, bg="#333333", fg=FG,
-                      command=self._clear_history).pack(side="left", padx=4)
+            # ══════════ RIGHT COLUMN ══════════
+            right = tk.Frame(columns, bg=BG)
+            right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-            # Separator
-            sep = tk.Frame(columns_frame, bg="#444444", width=1)
-            sep.grid(row=0, column=1, sticky="ns", padx=4, pady=8)
-
-            # ── Right column: LLM, Multi-Model Preview ──
-            right = tk.Frame(columns_frame, bg=BG)
-            right.grid(row=0, column=2, sticky="n", padx=(12, 0))
-
-            section_header(right, "LLM Text Cleanup", 0)
+            # -- LLM card --
+            llm_card = make_card(right)
+            llm_card.pack(fill="x", pady=(0, 8))
+            section_label(llm_card, "LLM Text Cleanup")
 
             llm_var = tk.BooleanVar(value=self._llm_cleanup)
             def _on_llm():
@@ -1757,14 +2027,13 @@ class WhisperTray:
                     threading.Thread(target=self._unload_ollama_model, daemon=True).start()
                 self._save_config()
                 self._rebuild_tray_menu()
-            add_toggle(right, "Enable LLM cleanup", llm_var, 1, _on_llm)
+            add_toggle(llm_card, "Enable LLM cleanup", llm_var, _on_llm)
 
             llm_model_var = tk.StringVar(value=self._llm_model)
-            model_om = add_dropdown(right, "LLM model:", llm_model_var,
-                                    LLM_MODEL_OPTIONS, 2,
+            model_om = add_dropdown(llm_card, "LLM model", llm_model_var,
+                                    LLM_MODEL_OPTIONS,
                                     command=lambda v: self._set_llm_model(v))
 
-            # Fetch installed models in background to update labels
             def _refresh_model_labels():
                 installed = self._get_installed_models()
                 def _update():
@@ -1780,7 +2049,8 @@ class WhisperTray:
             threading.Thread(target=_refresh_model_labels, daemon=True).start()
 
             prompt_var = tk.StringVar(value=self._llm_prompt)
-            add_dropdown(right, "Active style:", prompt_var, list(LLM_PROMPTS.keys()), 3,
+            add_dropdown(llm_card, "Active style", prompt_var,
+                         list(LLM_PROMPTS.keys()),
                          command=lambda v: self._set_llm_prompt(v))
 
             tone_var = tk.BooleanVar(value=self._tone_detect)
@@ -1788,29 +2058,32 @@ class WhisperTray:
                 self._tone_detect = tone_var.get()
                 self._save_config()
                 self._rebuild_tray_menu()
-            add_toggle(right, "Tone detection (emoji prefix)", tone_var, 4, _on_tone)
+            add_toggle(llm_card, "Tone detection (emoji prefix)", tone_var, _on_tone)
 
-            section_header(right, "Multi-Model Preview", 5)
+            # -- Multi-Model Preview card --
+            preview_card = make_card(right)
+            preview_card.pack(fill="x", pady=(0, 8))
+            section_label(preview_card, "Multi-Model Preview")
 
             debug_var = tk.BooleanVar(value=self._llm_debug)
             def _on_debug():
                 self._llm_debug = debug_var.get()
                 self._save_config()
                 self._rebuild_tray_menu()
-            add_toggle(right, "Enable Multi-Model Preview", debug_var, 6, _on_debug)
+            add_toggle(preview_card, "Enable preview", debug_var, _on_debug)
 
             auto_var = tk.BooleanVar(value=self._auto_submit)
             def _on_auto():
                 self._auto_submit = auto_var.get()
                 self._save_config()
-            add_toggle(right, "Auto-submit on select (Enter sends)", auto_var, 7, _on_auto)
+            add_toggle(preview_card, "Auto-submit (Enter sends)", auto_var, _on_auto)
 
-            # Preview styles checkboxes
-            tk.Label(right, text="Preview styles:", font=FONT, bg=BG, fg=FG,
-                     anchor="w").grid(row=8, column=0, sticky="nw", padx=20, pady=(6, 2))
+            # Style checkboxes with colored labels
+            tk.Label(preview_card, text="Preview styles", font=FONT, bg=CARD,
+                     fg=FG_DIM, anchor="w").pack(fill="x", pady=(6, 2))
 
             style_vars = {}
-            for i, name in enumerate(LLM_PROMPTS):
+            for name in LLM_PROMPTS:
                 svar = tk.BooleanVar(value=(name in self._llm_preview_styles))
                 style_vars[name] = svar
                 color = self.bubble._debug_colors.get(name, "#FFFFFF")
@@ -1823,16 +2096,21 @@ class WhisperTray:
                     self._llm_preview_styles = checked
                     self._save_config()
 
-                cb = tk.Checkbutton(right, text=name, variable=svar, font=FONT,
-                                    bg=BG, fg=color, selectcolor="#333333",
-                                    activebackground=BG, activeforeground=color,
+                cb = tk.Checkbutton(preview_card, text=name, variable=svar, font=FONT,
+                                    bg=CARD, fg=color, selectcolor=FIELD_BG,
+                                    activebackground=CARD, activeforeground=color,
                                     anchor="w", command=_on_style_toggle)
-                cb.grid(row=9 + i, column=0, columnspan=2, sticky="w", padx=32, pady=1)
+                cb.pack(fill="x", padx=(12, 0))
 
-            # ── Close button (bottom center, spanning both columns) ──
-            tk.Button(win, text="Close", font=FONT_BOLD, bg="#333333", fg=FG,
-                      command=win.destroy, padx=20, pady=4
-                      ).pack(pady=(12, 12))
+            # ── Close button ──
+            btn_frame = tk.Frame(win, bg=BG)
+            btn_frame.pack(fill="x", padx=16, pady=(4, 16))
+            close_btn = tk.Button(btn_frame, text="Close", font=FONT_BOLD,
+                                  bg=FIELD_BG, fg=FG, activebackground=ACCENT,
+                                  activeforeground="#FFFFFF", relief="flat",
+                                  borderwidth=0, padx=24, pady=6,
+                                  command=win.destroy)
+            close_btn.pack(side="right")
 
             # Center on screen
             win.update_idletasks()
@@ -1868,12 +2146,21 @@ class WhisperTray:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Settings...", lambda icon, item: self._open_settings()),
+            pystray.MenuItem("Restart Service", self._restart_app),
             pystray.MenuItem("Quit", self.quit_app),
         )
 
         if self.tray:
             self.tray.menu = menu
             self.tray.update_menu()
+
+    def _restart_app(self, icon, item):
+        """Restart the app by launching a new process and exiting this one."""
+        import subprocess
+        print("[RESTART] Restarting service...")
+        script = os.path.abspath(__file__)
+        subprocess.Popen([sys.executable, script], creationflags=0x00000008)  # DETACHED_PROCESS
+        self.quit_app(icon, item)
 
     def quit_app(self, icon, item):
         self._stop_event.set()
@@ -1905,6 +2192,7 @@ class WhisperTray:
 
         # Start overlay bubble with live FFT feed
         self.bubble = Bubble(fft_callback=self.get_fft_bars)
+        self.bubble.waveform_style = self._waveform_style
 
         # Audio stream setup
         self._sd = sd
