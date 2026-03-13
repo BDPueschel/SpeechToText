@@ -170,6 +170,7 @@ LLM_DEFAULT_PROMPT = "Minimal"
 NUM_BARS = 10
 FFT_CHUNK = 2048  # samples for FFT (~128ms at 16kHz)
 CHIME_RATE = 44100  # sample rate for chime playback
+DICTATION_HOTKEY = "alt+d"  # Default dictation toggle key
 
 
 def _generate_chime(freq, duration=0.12, volume=0.3, fade=0.03):
@@ -201,7 +202,7 @@ HOTKEY_OPTIONS = [
     "ctrl+`", "ctrl+\\",
     "ctrl+alt+r", "ctrl+alt+s", "ctrl+alt+w",
     # Alt combos
-    "alt+`", "alt+\\", "alt+q"
+    "alt+`", "alt+\\", "alt+q", "alt+d"
 ]
 
 
@@ -233,6 +234,25 @@ def detect_cuda():
         return False
 
 
+def auto_punctuate(text):
+    """Lightweight punctuation/capitalization without LLM."""
+    import re
+    if not text:
+        return text
+    text = text[0].upper() + text[1:]
+    text = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), text)
+    text = re.sub(r'\bi\b', 'I', text)
+    if text and text[-1] not in '.!?':
+        text += '.'
+    return text
+
+
+def _breathing_bars(phase, num_bars=NUM_BARS, amplitude=0.08, base=0.12, spacing=0.4):
+    """Generate gentle sine-wave bar heights for idle breathing animation."""
+    import math
+    return [base + amplitude * math.sin(phase + i * spacing) for i in range(num_bars)]
+
+
 def make_icon_image(color):
     """Create a simple colored circle icon for the system tray."""
     from PIL import Image, ImageDraw
@@ -240,6 +260,44 @@ def make_icon_image(color):
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([4, 4, size - 4, size - 4], fill=color)
+    return img
+
+
+def make_tray_fft_icon(bar_heights, accent_rgb=None, dim=False):
+    """Create a 64x64 tray icon with mini FFT bars."""
+    from PIL import Image, ImageDraw
+    import colorsys
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Dark circular background
+    draw.ellipse([2, 2, size - 2, size - 2], fill=(20, 22, 30, 220))
+
+    ar, ag, ab = accent_rgb or _ACCENT_RGB
+    ah, as_, av = colorsys.rgb_to_hsv(ar / 255, ag / 255, ab / 255)
+    if dim:
+        av *= 0.5
+        as_ *= 0.7
+
+    num = len(bar_heights)
+    pad = 12
+    usable = size - 2 * pad
+    bar_w = max(2, usable // (num * 2 - 1) + 1)
+    gap = max(1, bar_w // 2)
+    total_w = num * bar_w + (num - 1) * gap
+    x_start = (size - total_w) // 2
+    cy = size // 2
+    max_h = (size - 2 * pad) // 2
+
+    for i, bh in enumerate(bar_heights):
+        t = (i + 0.5) / num
+        hue = (ah + (t - 0.5) * 0.1) % 1.0
+        rv, gv, bv = colorsys.hsv_to_rgb(hue, min(1.0, as_), min(1.0, av))
+        r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+        h = max(2, int(max_h * max(0.08, bh)))
+        x = x_start + i * (bar_w + gap)
+        draw.rounded_rectangle([x, cy - h, x + bar_w, cy + h],
+                               radius=max(1, bar_w // 3), fill=(r, g, b, 220 if not dim else 140))
     return img
 
 
@@ -418,6 +476,24 @@ def draw_waveform(size=70, color=None, bar_heights=None, style="Bars"):
         wave_glow = wave_glow.filter(ImageFilter.GaussianBlur(radius=3))
         img = Image.alpha_composite(img, wave_glow)
 
+    # --- Flatten alpha for Windows color-key transparency ---
+    # Tkinter's -transparentcolor is binary (no partial transparency),
+    # so semi-transparent glow pixels would show as dark fringe on light
+    # backgrounds. Threshold: low-alpha pixels become the key color,
+    # everything else composites onto it as fully opaque.
+    arr = np.array(img)
+    alpha = arr[:, :, 3]
+    key = (1, 1, 1)  # matches Bubble.TRANSPARENT "#010101"
+    # Pixels below threshold → fully transparent key color
+    mask = alpha < 25
+    arr[mask] = (*key, 255)
+    # Remaining pixels: composite onto the key color so they're fully opaque
+    a = alpha[~mask].astype(np.float32) / 255.0
+    for c in range(3):
+        arr[~mask, c] = (arr[~mask, c] * a + key[c] * (1 - a) + 0.5).astype(np.uint8)
+    arr[:, :, 3] = 255  # fully opaque everywhere
+    img = Image.fromarray(arr, "RGBA")
+
     return img
 
 
@@ -502,6 +578,31 @@ class Bubble:
             padx=4,
             pady=0,
         )
+
+        # Live transcription preview panel (to the right of the pill)
+        _prev_bg = "#0c0d10"
+        self._preview_frame = tk.Frame(self._frame, bg=_prev_bg)
+        self._preview_text = tk.Text(
+            self._preview_frame,
+            font=("Segoe UI", 12),
+            bg=_prev_bg,
+            fg="#CCCCCC",
+            padx=14,
+            pady=8,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            state="disabled",
+            width=44,
+            height=8,
+            cursor="arrow",
+        )
+        self._preview_text.tag_configure("scratched", foreground="#e05252", overstrike=True)
+        self._preview_text.tag_configure("kept", foreground="#d4d6de")
+        self._preview_text.pack(fill="both", expand=True)
+        self._scratch_anim_job = None  # after() ID for scratch animation
+        self._preview_font = "Segoe UI"  # track current font for scratch animation
 
         # Side-by-side comparison labels for LLM cleanup
         self._compare_frame = tk.Frame(self._frame, bg=self.TRANSPARENT)
@@ -611,14 +712,16 @@ class Bubble:
 
         self._fade_job = self._root.after(self.FADE_MS, _tick)
 
-    def show(self, text, style="recording", duration=None, original=None, debug_results=None):
+    def show(self, text, style="recording", duration=None, original=None, debug_results=None, low_confidence=False):
         def _update():
             self._cancel_animations()
+            self.stop_idle_breathing()
             self._current_style = style
 
             self._mic_label.pack_forget()
             self._label.pack_forget()
             self._timer_label.pack_forget()
+            self._preview_frame.pack_forget()
             self._compare_frame.pack_forget()
             self._debug_frame.pack_forget()
 
@@ -731,7 +834,8 @@ class Bubble:
                 self._mic_label.config(image=self._mic_images["result"], bg=self.TRANSPARENT)
                 self._mic_label.pack(side="left", padx=(8, 0), pady=4)
 
-                self._label.config(text=text, bg=self.TRANSPARENT, fg="#FFFFFF")
+                text_fg = "#FFB74D" if low_confidence else "#FFFFFF"
+                self._label.config(text=text, bg=self.TRANSPARENT, fg=text_fg)
                 self._label.pack(side="left", padx=(4, 16), pady=4)
             else:
                 self._root.config(bg=self.TRANSPARENT)
@@ -803,11 +907,214 @@ class Bubble:
         """Dismiss Multi-Model Preview without selecting."""
         self._root.after(0, self._do_hide)
 
+    _PREVIEW_DIM = "#3a3c48"     # starting dim color
+    _PREVIEW_BRIGHT = "#d4d6de"  # final bright color
+
+    def _parse_hex(self, hex_color):
+        h = hex_color.lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+    def _lerp_color(self, c1, c2, t):
+        r = int(c1[0] + (c2[0] - c1[0]) * t)
+        g = int(c1[1] + (c2[1] - c1[1]) * t)
+        b = int(c1[2] + (c2[2] - c1[2]) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _set_preview_content(self, text, tag=None):
+        """Helper: replace all text in the preview Text widget."""
+        self._preview_text.config(state="normal")
+        self._preview_text.delete("1.0", "end")
+        if text:
+            self._preview_text.insert("1.0", text, tag or ())
+        self._preview_text.see("end")
+        self._preview_text.config(state="disabled")
+
+    def _get_preview_content(self):
+        """Helper: get current preview text."""
+        return self._preview_text.get("1.0", "end-1c")
+
+    def update_preview(self, text):
+        """Show or update live transcription text with fade-in animation."""
+        def _update():
+            if not text:
+                self._preview_frame.pack_forget()
+                self._position_bottom_center()
+                return
+
+            old_text = self._get_preview_content()
+            self._set_preview_content(text)
+
+            # Pack if not already visible
+            if not self._preview_frame.winfo_ismapped():
+                self._preview_frame.pack(side="right", padx=(8, 0), pady=4, fill="y")
+            self._position_bottom_center()
+
+            # Only animate if text actually changed
+            if text != old_text:
+                self._animate_preview_fade()
+
+        self._root.after(0, _update)
+
+    def _animate_preview_fade(self):
+        """Fade preview text from dim to bright over ~300ms."""
+        # Cancel any running fade
+        if hasattr(self, "_preview_fade_job") and self._preview_fade_job:
+            self._root.after_cancel(self._preview_fade_job)
+            self._preview_fade_job = None
+
+        dim = self._parse_hex(self._PREVIEW_DIM)
+        bright = self._parse_hex(self._PREVIEW_BRIGHT)
+        steps = 8
+        step_ms = 35  # ~280ms total
+        step_i = [0]
+
+        def _tick():
+            step_i[0] += 1
+            t = step_i[0] / steps
+            t = 1 - (1 - t) ** 2
+            color = self._lerp_color(dim, bright, t)
+            self._preview_text.config(fg=color)
+            if step_i[0] < steps:
+                self._preview_fade_job = self._root.after(step_ms, _tick)
+            else:
+                self._preview_fade_job = None
+
+        self._preview_text.config(fg=self._PREVIEW_DIM)
+        self._preview_fade_job = self._root.after(step_ms, _tick)
+
+    def update_preview_scratch(self, original_text, clean_text):
+        """Show scratch animation: kept text stays normal, removed text gets red strikethrough."""
+        def _do():
+            # Cancel any pending scratch or fade animations
+            if self._scratch_anim_job:
+                self._root.after_cancel(self._scratch_anim_job)
+                self._scratch_anim_job = None
+            if hasattr(self, "_preview_fade_job") and self._preview_fade_job:
+                self._root.after_cancel(self._preview_fade_job)
+                self._preview_fade_job = None
+
+            # Find common prefix and suffix to identify the removed portion
+            prefix_len = 0
+            for i in range(min(len(original_text), len(clean_text))):
+                if original_text[i] == clean_text[i]:
+                    prefix_len = i + 1
+                else:
+                    break
+
+            clean_rest = clean_text[prefix_len:]
+            if clean_rest and original_text.rstrip().endswith(clean_rest.rstrip()):
+                # There's text after the scratch too
+                suffix_start = len(original_text) - len(clean_rest)
+                removed = original_text[prefix_len:suffix_start]
+                after = original_text[suffix_start:]
+            else:
+                removed = original_text[prefix_len:]
+                after = ""
+
+            kept_before = original_text[:prefix_len]
+
+            # Phase 1: Show original with removed portion in red strikethrough
+            self._preview_text.config(state="normal")
+            self._preview_text.delete("1.0", "end")
+            if kept_before:
+                self._preview_text.insert("end", kept_before, "kept")
+            if removed:
+                self._preview_text.insert("end", removed, "scratched")
+            if after:
+                self._preview_text.insert("end", after, "kept")
+            self._preview_text.see("end")
+            self._preview_text.config(state="disabled")
+
+            # Ensure visible
+            if not self._preview_frame.winfo_ismapped():
+                self._preview_frame.pack(side="right", padx=(8, 0), pady=4, fill="y")
+            self._position_bottom_center()
+
+            # Phase 2: After 600ms, transition to clean text with fade-in
+            def _show_clean():
+                self._scratch_anim_job = None
+                if clean_text:
+                    self._set_preview_content(clean_text)
+                    self._animate_preview_fade()
+                else:
+                    self._set_preview_content("")
+                    self._preview_frame.pack_forget()
+                    self._position_bottom_center()
+
+            self._scratch_anim_job = self._root.after(600, _show_clean)
+
+        self._root.after(0, _do)
+
+    def set_display_font(self, font_family):
+        """Update the font on all text-display labels."""
+        self._preview_font = font_family
+        def _update():
+            self._label.config(font=(font_family, 18, "bold"))
+            self._timer_label.config(font=(font_family, 12))
+            self._preview_text.config(font=(font_family, 12))
+            self._orig_label.config(font=(font_family, 14))
+            self._clean_label.config(font=(font_family, 16, "bold"))
+        self._root.after(0, _update)
+
+    def hide_preview(self):
+        """Hide the live transcription preview panel."""
+        def _update():
+            if hasattr(self, "_preview_fade_job") and self._preview_fade_job:
+                self._root.after_cancel(self._preview_fade_job)
+                self._preview_fade_job = None
+            self._preview_frame.pack_forget()
+            self._position_bottom_center()
+        self._root.after(0, _update)
+
+    def start_idle_breathing(self):
+        """Show a gentle breathing animation on the pill when idle."""
+        def _start():
+            self._cancel_animations()
+            self._idle_phase = getattr(self, "_idle_phase", 0.0)
+
+            self._mic_label.pack_forget()
+            self._label.pack_forget()
+            self._timer_label.pack_forget()
+            self._preview_frame.pack_forget()
+            self._compare_frame.pack_forget()
+            self._debug_frame.pack_forget()
+
+            self._root.config(bg=self.TRANSPARENT)
+            self._frame.config(bg=self.TRANSPARENT)
+            self._root.attributes("-transparentcolor", self.TRANSPARENT)
+            self._mic_label.config(bg=self.TRANSPARENT)
+            self._mic_label.pack()
+
+            self._root.deiconify()
+            self._root.lift()
+            self._alpha = 0.4
+            self._root.attributes("-alpha", 0.4)
+            self._position_bottom_center()
+            self._idle_breathing_tick()
+
+        self._root.after(0, _start)
+
+    def _idle_breathing_tick(self):
+        import math
+        self._idle_phase = getattr(self, "_idle_phase", 0.0) + 0.1
+        bars = _breathing_bars(self._idle_phase)
+        photo = self._build_waveform_photo(self._accent_hex, bar_heights=bars)
+        self._mic_label.config(image=photo)
+        self._mic_label._idle_photo = photo
+        self._idle_anim_job = self._root.after(80, self._idle_breathing_tick)
+
+    def stop_idle_breathing(self):
+        """Stop idle breathing animation."""
+        if hasattr(self, "_idle_anim_job") and self._idle_anim_job:
+            self._root.after_cancel(self._idle_anim_job)
+            self._idle_anim_job = None
+
     def hide(self):
         self._root.after(0, self._do_hide)
 
     def _do_hide(self):
         self._hide_timer = None
+        self.stop_idle_breathing()
         if self._fade_job is not None:
             self._root.after_cancel(self._fade_job)
             self._fade_job = None
@@ -856,6 +1163,25 @@ class WhisperTray:
         self._bubble_duration = BUBBLE_DURATION
         self._privacy_mic = PRIVACY_MIC
         self._waveform_style = "Bars"  # "Bars" or "Wave"
+        self._display_font = "Segoe UI"  # Font for result text, timer, preview
+        self._live_preview = False  # Show live transcription while recording
+        self._live_stop = threading.Event()
+        self._live_transcribe_lock = threading.Lock()
+        self._auto_punctuate = False  # Lightweight auto-punctuation
+        self._confidence_coloring = False  # Tint low-confidence results
+        self._scratch_that = True  # "Scratch that" undo support
+        self._idle_breathing = False  # Idle breathing animation
+        self._tray_visualizer = False  # Animated FFT tray icon
+        self._tray_idle_stop = threading.Event()
+        self._tray_fft_stop = threading.Event()
+        # Dictation mode
+        self._dictation_hotkey = DICTATION_HOTKEY
+        self._is_dictation_mode = False
+        # Paste tracking for "scratch that"
+        self._last_pasted_text = ""
+        self._last_pasted_len = 0
+        # Confidence tracking
+        self._segment_logprobs = []
         self._cancel_requested = False
         self._recording_timer = None
         # History log
@@ -864,6 +1190,9 @@ class WhisperTray:
         self._load_history()
         # Streaming transcription state
         self._stream_text = ""
+        # Scratch-that live preview state: avoid re-transcribing already-scratched audio
+        self._scratch_clean_prefix = ""   # cached clean text up to last scratch
+        self._scratch_buf_offset = 0      # audio buffer chunks already processed before scratch
         self._stream_lock = threading.Lock()
         self._icon_lock = threading.Lock()
         self._nav_hooks = []  # Multi-Model Preview keyboard hooks
@@ -895,6 +1224,14 @@ class WhisperTray:
             self._bubble_duration = cfg.get("bubble_duration", self._bubble_duration)
             self._privacy_mic = cfg.get("privacy_mic", self._privacy_mic)
             self._waveform_style = cfg.get("waveform_style", self._waveform_style)
+            self._display_font = cfg.get("display_font", self._display_font)
+            self._live_preview = cfg.get("live_preview", self._live_preview)
+            self._auto_punctuate = cfg.get("auto_punctuate", self._auto_punctuate)
+            self._confidence_coloring = cfg.get("confidence_coloring", self._confidence_coloring)
+            self._scratch_that = cfg.get("scratch_that", self._scratch_that)
+            self._idle_breathing = cfg.get("idle_breathing", self._idle_breathing)
+            self._tray_visualizer = cfg.get("tray_visualizer", self._tray_visualizer)
+            self._dictation_hotkey = cfg.get("dictation_hotkey", self._dictation_hotkey)
             # Load custom prompts into LLM_PROMPTS
             for name, template in cfg.get("custom_prompts", {}).items():
                 LLM_PROMPTS[name] = template
@@ -928,6 +1265,14 @@ class WhisperTray:
             "bubble_duration": self._bubble_duration,
             "privacy_mic": self._privacy_mic,
             "waveform_style": self._waveform_style,
+            "display_font": self._display_font,
+            "live_preview": self._live_preview,
+            "auto_punctuate": self._auto_punctuate,
+            "confidence_coloring": self._confidence_coloring,
+            "scratch_that": self._scratch_that,
+            "idle_breathing": self._idle_breathing,
+            "tray_visualizer": self._tray_visualizer,
+            "dictation_hotkey": self._dictation_hotkey,
             "cuda_verified": getattr(self, "_cuda_verified", False),
         }
         # Preserve custom_prompts if they exist in the file
@@ -1157,6 +1502,7 @@ class WhisperTray:
     def transcribe_streaming(self, audio_np):
         """Transcribe and update the bubble progressively as segments arrive."""
         self._streaming_done = False
+        self._segment_logprobs = []
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_path = f.name
         try:
@@ -1169,6 +1515,7 @@ class WhisperTray:
             parts = []
             for seg in segments:
                 parts.append(seg.text.strip())
+                self._segment_logprobs.append(seg.avg_logprob)
                 text_so_far = " ".join(parts)
                 with self._stream_lock:
                     self._stream_text = text_so_far
@@ -1181,6 +1528,87 @@ class WhisperTray:
             except OSError:
                 pass
         return self._stream_text
+
+    def _live_preview_loop(self):
+        """Periodically transcribe accumulated audio and show preview while recording."""
+        log.debug("_live_preview_loop START")
+        # Wait a bit before first attempt so there's enough audio
+        if self._live_stop.wait(timeout=2.0):
+            log.debug("_live_preview_loop: stopped before first chunk")
+            return
+        while not self._live_stop.is_set():
+            buf_copy = list(self.audio_buffer)
+            # After a scratch, only transcribe audio recorded AFTER the scratch point
+            offset = self._scratch_buf_offset
+            new_chunks = buf_copy[offset:]
+            if len(new_chunks) < 2:  # need some audio
+                if self._live_stop.wait(timeout=1.0):
+                    break
+                continue
+            audio_snapshot = np.concatenate(new_chunks)
+            if len(audio_snapshot) < SAMPLE_RATE:  # less than 1 second
+                if self._live_stop.wait(timeout=1.0):
+                    break
+                continue
+            # Non-blocking: skip if previous chunk still transcribing
+            if not self._live_transcribe_lock.acquire(blocking=False):
+                log.debug("_live_preview_loop: skipping (lock held)")
+                if self._live_stop.wait(timeout=1.0):
+                    break
+                continue
+            try:
+                new_text = self._transcribe_fast(audio_snapshot)
+                prefix = self._scratch_clean_prefix
+                # Combine cached prefix with newly transcribed text
+                if prefix and new_text:
+                    text = prefix + " " + new_text
+                else:
+                    text = prefix or new_text or ""
+
+                if text and not self._live_stop.is_set():
+                    # Apply inline scratch-that
+                    if self._scratch_that:
+                        clean_text, scratched = self._apply_scratch_that(text)
+                        if scratched:
+                            log.debug(f"_live_preview: scratch applied → '{clean_text[:60]}'")
+                            # Cache the clean text and mark current buffer position
+                            self._scratch_clean_prefix = clean_text
+                            self._scratch_buf_offset = len(buf_copy)
+                            # Show original with red strikethrough on removed parts
+                            self.bubble.update_preview_scratch(text, clean_text)
+                            if self._live_stop.wait(timeout=2.0):
+                                break
+                            continue
+                        text = clean_text
+                    log.debug(f"_live_preview: '{text[:60]}'")
+                    self.bubble.update_preview(text)
+            except Exception as e:
+                log.debug(f"_live_preview_loop error: {e}")
+            finally:
+                self._live_transcribe_lock.release()
+            # Wait before next chunk
+            if self._live_stop.wait(timeout=2.0):
+                break
+        log.debug("_live_preview_loop DONE")
+
+    def _transcribe_fast(self, audio_np):
+        """Fast transcription for live preview (beam_size=1, no VAD)."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        try:
+            self.write_wav(tmp_path, audio_np)
+            lang = "en" if self._whisper_model.endswith(".en") else None
+            segments, _ = self.model.transcribe(
+                tmp_path, beam_size=1, language=lang,
+                vad_filter=False,
+            )
+            text = " ".join(s.text.strip() for s in segments).strip()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return text
 
     def _ollama_post(self, path, payload_dict, timeout=30):
         """Low-level HTTP POST to Ollama using http.client (no urllib global state)."""
@@ -1291,6 +1719,142 @@ class WhisperTray:
         if APPEND_ENTER:
             time.sleep(0.05)
             pyautogui.press("enter")
+        # Track for "scratch that"
+        self._last_pasted_text = text
+        self._last_pasted_len = len(text) + (1 if APPEND_ENTER else 0)
+
+    _SCRATCH_TRIGGERS = [
+        "scratch that", "scratch this", "undo that", "undo this",
+        "never mind", "nevermind", "delete that", "erase that",
+        "take that back", "remove that",
+    ]
+
+    def _apply_scratch_that(self, text):
+        """Process text inline: find 'scratch that' triggers and remove the
+        preceding sentence for each occurrence.  Returns (cleaned_text, had_scratch).
+
+        Example:
+          "The meeting was great. The cake was bad. Scratch that. Let's move on."
+        → ("The meeting was great. Let's move on.", True)
+        """
+        import re
+        if not text:
+            return text, False
+
+        had_scratch = False
+        # Build a regex that matches any trigger (case-insensitive), possibly
+        # preceded by filler words and surrounded by punctuation/spaces
+        filler = r'(?:(?:um+|uh+|oh+|ah+|okay|ok|so|well|hey|actually|please|yeah)[,\s]*)*'
+        trigger_pattern = '|'.join(re.escape(t) for t in self._SCRATCH_TRIGGERS)
+        # Match: optional leading punct/space, optional filler, the trigger, optional trailing punct/space
+        pattern = re.compile(
+            r'[,.\s]*' + filler + r'(' + trigger_pattern + r')[.,!?\s]*',
+            re.IGNORECASE,
+        )
+
+        # Process from right to left so indices stay valid
+        matches = list(pattern.finditer(text))
+        for match in reversed(matches):
+            had_scratch = True
+            before = text[:match.start()]
+            after = text[match.end():]
+
+            # Remove the last sentence from 'before'
+            # Split on sentence-ending punctuation followed by space
+            before = before.rstrip()
+            if before:
+                # Find the last sentence boundary (.!? followed by space or end)
+                sent_boundaries = list(re.finditer(r'[.!?]\s+', before))
+                if sent_boundaries:
+                    # Keep everything up to and including the last boundary
+                    cut_point = sent_boundaries[-1].end()
+                    before = before[:cut_point].rstrip()
+                else:
+                    # No sentence boundary — the whole 'before' is one sentence, remove it all
+                    before = ""
+
+            text = (before + " " + after).strip() if before and after else (before or after).strip()
+
+        return text, had_scratch
+
+    def _undo_last_paste(self):
+        """Remove the previously pasted text by selecting it backwards and deleting."""
+        if self._last_pasted_len == 0:
+            return
+        import pyautogui
+        # Shift+Left to select the pasted text, then delete — much faster than
+        # individual backspaces for long text
+        for _ in range(self._last_pasted_len):
+            pyautogui.hotkey("shift", "left")
+        pyautogui.press("delete")
+        self._last_pasted_len = 0
+        self._last_pasted_text = ""
+
+    def _is_low_confidence(self):
+        """Check if the transcription had low confidence."""
+        if not self._segment_logprobs:
+            return False
+        avg = sum(self._segment_logprobs) / len(self._segment_logprobs)
+        return avg < -0.8
+
+    def on_dictation_toggle(self):
+        """Toggle dictation mode on/off (press once to start, again to stop)."""
+        if not self.is_recording:
+            self._is_dictation_mode = True
+            self.on_key_down()
+        elif self._is_dictation_mode:
+            self._is_dictation_mode = False
+            self.on_key_up()
+
+    # -- Tray visualizer --
+
+    def _start_tray_fft(self):
+        """Start animating the tray icon with live FFT data."""
+        if not self._tray_visualizer:
+            return
+        self._tray_idle_stop.set()
+        self._tray_fft_stop.clear()
+
+        def _loop():
+            while not self._tray_fft_stop.wait(timeout=0.2):
+                try:
+                    bars = self.get_fft_bars()
+                    icon = make_tray_fft_icon(bars)
+                    if self._icon_lock.acquire(timeout=1):
+                        try:
+                            self.tray.icon = icon
+                        finally:
+                            self._icon_lock.release()
+                except Exception:
+                    pass
+        threading.Thread(target=_loop, daemon=True, name="tray-fft").start()
+
+    def _start_tray_idle(self):
+        """Start the tray idle breathing animation."""
+        if not self._tray_visualizer:
+            return
+        self._tray_fft_stop.set()
+        self._tray_idle_stop.clear()
+
+        def _loop():
+            phase = 0.0
+            while not self._tray_idle_stop.wait(timeout=0.33):
+                try:
+                    bars = _breathing_bars(phase)
+                    icon = make_tray_fft_icon(bars, dim=True)
+                    if self._icon_lock.acquire(timeout=1):
+                        try:
+                            self.tray.icon = icon
+                        finally:
+                            self._icon_lock.release()
+                    phase += 0.15
+                except Exception:
+                    pass
+        threading.Thread(target=_loop, daemon=True, name="tray-idle").start()
+
+    def _stop_tray_animations(self):
+        self._tray_fft_stop.set()
+        self._tray_idle_stop.set()
 
     def _cancel_recording(self):
         """Cancel the current recording without transcribing."""
@@ -1300,8 +1864,11 @@ class WhisperTray:
         if self._privacy_mic:
             threading.Thread(target=self._close_audio_stream, daemon=True, name="close-stream").start()
         self._cancel_requested = True
+        self._is_dictation_mode = False
+        self._live_stop.set()
         self.audio_buffer.clear()
         self.set_icon(self.COLOR_READY)
+        self.bubble.hide_preview()
         self.bubble.show("Cancelled", style="transcribing", duration=1)
         print("[CANCEL] Recording cancelled.")
 
@@ -1342,11 +1909,18 @@ class WhisperTray:
             self.audio_buffer.clear()
             self._viz_buffer[:] = 0
             self._stream_text = ""
+            self._scratch_clean_prefix = ""
+            self._scratch_buf_offset = 0
             self.start_time = time.time()
             self.set_icon(self.COLOR_RECORDING)
+            self._start_tray_fft()
             self.bubble.show("0:00", style="recording")
             self.play_chime(CHIME_START)
             self._start_recording_timer()
+            # Start live transcription preview if enabled
+            if self._live_preview:
+                self._live_stop.clear()
+                threading.Thread(target=self._live_preview_loop, daemon=True, name="live-preview").start()
             # Clean up any stale debug nav hooks from previous multi-model preview
             self._cleanup_nav_hooks_async()
             log.debug("_do_key_down DONE"); sys.stdout.flush()
@@ -1356,15 +1930,20 @@ class WhisperTray:
 
     def on_key_up(self):
         log.debug("on_key_up START")
+        if self._is_dictation_mode:
+            log.debug("on_key_up SKIP (dictation mode active)")
+            return
         if not self.is_recording and not self._cancel_requested:
             log.debug("on_key_up SKIP (not recording)")
             return
         self.is_recording = False
+        self._live_stop.set()  # signal live preview loop to exit
         # Run the rest off the keyboard thread to avoid blocking it
         threading.Thread(target=self._do_key_up, daemon=True, name="key-up").start()
 
     def _do_key_up(self):
         log.debug("_do_key_up START"); sys.stdout.flush()
+        self.bubble.hide_preview()
         if self._privacy_mic:
             self._close_audio_stream()
         if self._recording_timer:
@@ -1373,6 +1952,12 @@ class WhisperTray:
         if self._cancel_requested:
             self._cancel_requested = False
             return
+
+        # Wait for any in-flight live transcription to finish before starting
+        # the final transcription — concurrent model.transcribe() calls produce
+        # corrupted/partial results
+        self._live_transcribe_lock.acquire()
+        self._live_transcribe_lock.release()
 
         elapsed = time.time() - self.start_time
         log.debug(f"_do_key_up: elapsed={elapsed:.2f}, buffer={len(self.audio_buffer)}"); sys.stdout.flush()
@@ -1387,18 +1972,81 @@ class WhisperTray:
         log.debug("_do_key_up: bubble show"); sys.stdout.flush()
         self.bubble.show("Transcribing...", style="transcribing")
         log.debug("_do_key_up: concat audio"); sys.stdout.flush()
-        audio_np = np.concatenate(self.audio_buffer)
-        peak = np.max(np.abs(audio_np))
-        rms = np.sqrt(np.mean(audio_np ** 2))
-        print(f"[AUDIO] {elapsed:.1f}s, {len(audio_np)} samples, peak={peak:.4f}, rms={rms:.4f}")
+
+        # If scratch was applied during live preview, split audio at the scratch
+        # boundary so the scratched content is never re-transcribed. This avoids
+        # relying on regex matching a second time on beam_size=3 output.
+        scratch_prefix = ""
+        if self._scratch_that and self._scratch_buf_offset > 0:
+            buf_list = list(self.audio_buffer)
+            pre_chunks = buf_list[:self._scratch_buf_offset]
+            post_chunks = buf_list[self._scratch_buf_offset:]
+            if pre_chunks:
+                pre_audio = np.concatenate(pre_chunks)
+                print(f"[SCRATCH] Re-transcribing pre-scratch audio ({len(pre_chunks)} chunks)")
+                pre_text = self.transcribe_streaming(pre_audio)
+                if pre_text:
+                    # Apply scratch to pre-scratch audio (contains trigger + scratched sentence)
+                    pre_text, _ = self._apply_scratch_that(pre_text)
+                scratch_prefix = pre_text or ""
+            if post_chunks:
+                audio_np = np.concatenate(post_chunks)
+            else:
+                audio_np = None
+        else:
+            audio_np = np.concatenate(self.audio_buffer)
+
+        if audio_np is not None:
+            peak = np.max(np.abs(audio_np))
+            rms = np.sqrt(np.mean(audio_np ** 2))
+            print(f"[AUDIO] {elapsed:.1f}s, {len(audio_np)} samples, peak={peak:.4f}, rms={rms:.4f}")
 
         def _do_transcribe():
             log.debug("_do_transcribe START")
-            log.debug("transcribe_streaming START")
-            raw_text = self.transcribe_streaming(audio_np)
-            log.debug(f"transcribe_streaming DONE: '{raw_text[:80] if raw_text else ''}'")
+            if audio_np is not None:
+                log.debug("transcribe_streaming START")
+                post_text = self.transcribe_streaming(audio_np)
+                log.debug(f"transcribe_streaming DONE: '{post_text[:80] if post_text else ''}'")
+            else:
+                post_text = ""
+
+            # Combine scratch prefix with post-scratch transcription
+            if scratch_prefix and post_text:
+                raw_text = scratch_prefix + " " + post_text
+            elif scratch_prefix:
+                raw_text = scratch_prefix
+            else:
+                raw_text = post_text
+
             if raw_text:
                 print(f"[TEXT ] {raw_text}")
+
+                # Inline "scratch that" — catch any NEW triggers in post-scratch text
+                if self._scratch_that:
+                    raw_text, had_scratch = self._apply_scratch_that(raw_text)
+                    if had_scratch:
+                        print(f"[SCRATCH] Applied inline scratch → '{raw_text}'")
+                    if not raw_text:
+                        # Everything was scratched — nothing left to paste
+                        self.play_chime(CHIME_DONE)
+                        self.bubble.show("Scratched!", style="result", duration=1.5)
+                        self.set_icon(self.COLOR_READY)
+                        self._start_tray_idle()
+                        if self._idle_breathing:
+                            self.bubble._root.after(2000, lambda: self.bubble.start_idle_breathing()
+                                                    if not self.is_recording else None)
+                        return
+
+                # Auto-punctuation (before LLM)
+                if self._auto_punctuate:
+                    raw_text = auto_punctuate(raw_text)
+                    print(f"[PUNCT] {raw_text}")
+
+                # Confidence check
+                low_conf = self._confidence_coloring and self._is_low_confidence()
+                if low_conf:
+                    avg_lp = sum(self._segment_logprobs) / len(self._segment_logprobs)
+                    print(f"[CONF ] Low confidence (avg_logprob={avg_lp:.2f})")
 
                 # Tone detection setup
                 tone_emoji = None
@@ -1446,10 +2094,18 @@ class WhisperTray:
                     user32 = ctypes.windll.user32
                     saved_hwnd = user32.GetForegroundWindow()
 
+                    def _restart_idle_after_debug():
+                        """Restart idle animations after debug selection/dismiss."""
+                        self._start_tray_idle()
+                        if self._idle_breathing:
+                            self.bubble._root.after(1500, lambda: self.bubble.start_idle_breathing()
+                                                    if not self.is_recording else None)
+
                     def _on_debug_select(selected_text, shift_held=False):
                         import pyautogui
                         print(f"[LLM  ] Selected (shift={shift_held}): {selected_text}")
                         self._cleanup_nav_hooks_async()
+                        _restart_idle_after_debug()
                         # Run paste on a background thread to avoid blocking tkinter
                         def _do_paste():
                             time.sleep(0.1)
@@ -1480,12 +2136,24 @@ class WhisperTray:
                         elif e.name == "esc":
                             self._cleanup_nav_hooks_async()
                             self.bubble.debug_dismiss()
+                            _restart_idle_after_debug()
 
                     self._nav_hooks = [kb.hook(_on_nav_key, suppress=True)]
                     self.bubble._on_select = _on_debug_select
                     self.play_chime(CHIME_DONE)
                     original_display = f"{detected_tone} {raw_text}" if detected_tone else raw_text
                     self.bubble.show(None, style="debug", original=original_display, debug_results=all_results)
+                    # Debug mode stays open until user picks — skip idle animations
+                    # (they get cleaned up when user selects/dismisses via nav hooks)
+                    self.set_icon(self.COLOR_READY)
+                    self._add_history(
+                        raw=raw_text,
+                        final="(preview mode)",
+                        style=self._llm_prompt if self._llm_cleanup else None,
+                        tone=detected_tone,
+                    )
+                    log.debug("_do_transcribe DONE (debug mode, waiting for selection)")
+                    return
                 elif self._llm_cleanup:
                     log.debug("cleanup_text START (single-model)")
                     cleaned = self.cleanup_text(raw_text)
@@ -1515,9 +2183,11 @@ class WhisperTray:
                     self.paste_text(final_text)
                     log.debug("paste_text DONE"); sys.stdout.flush()
                     if final_text != raw_text and self._bubble_duration > 0:
-                        self.bubble.show(final_text, style="compare", duration=self._bubble_duration, original=raw_text)
+                        self.bubble.show(final_text, style="compare", duration=self._bubble_duration,
+                                         original=raw_text, low_confidence=low_conf)
                     elif self._bubble_duration > 0:
-                        self.bubble.show(final_text, style="result", duration=self._bubble_duration)
+                        self.bubble.show(final_text, style="result", duration=self._bubble_duration,
+                                         low_confidence=low_conf)
                     else:
                         self.bubble.hide()
                 else:
@@ -1525,7 +2195,8 @@ class WhisperTray:
                     self.play_chime(CHIME_DONE)
                     self.paste_text(final_text)
                     if self._bubble_duration > 0:
-                        self.bubble.show(final_text, style="result", duration=self._bubble_duration)
+                        self.bubble.show(final_text, style="result", duration=self._bubble_duration,
+                                         low_confidence=low_conf)
                     else:
                         self.bubble.hide()
 
@@ -1541,6 +2212,12 @@ class WhisperTray:
                 self.bubble.show("(nothing heard)", style="transcribing", duration=1.5)
             log.debug("_do_transcribe: set_icon READY"); sys.stdout.flush()
             self.set_icon(self.COLOR_READY)
+            self._start_tray_idle()
+            # Restart idle breathing after bubble duration
+            if self._idle_breathing:
+                delay = int((self._bubble_duration + 0.5) * 1000) if self._bubble_duration > 0 else 500
+                self.bubble._root.after(delay, lambda: self.bubble.start_idle_breathing()
+                                        if not self.is_recording else None)
             log.debug("_do_transcribe DONE"); sys.stdout.flush()
 
         threading.Thread(target=_do_transcribe, daemon=True).start()
@@ -1564,6 +2241,11 @@ class WhisperTray:
             keyboard.on_press_key(self._hotkey, lambda e: self.on_key_down(), suppress=False)
             keyboard.on_release_key(self._hotkey, lambda e: self.on_key_up(), suppress=False)
             self._chord_trigger_key = None
+        # Register dictation toggle hotkey
+        if self._is_chord(self._dictation_hotkey):
+            keyboard.add_hotkey(self._dictation_hotkey, self.on_dictation_toggle, suppress=False)
+        else:
+            keyboard.on_press_key(self._dictation_hotkey, lambda e: self.on_dictation_toggle(), suppress=False)
         # Register Escape to cancel recording (always active, gated by is_recording)
         keyboard.on_press_key("esc", lambda e: self._cancel_recording(), suppress=False)
 
@@ -1964,6 +2646,25 @@ class WhisperTray:
             add_dropdown(rec_card, "Visualizer", wave_style_var,
                          ["Bars", "Wave"], command=_on_wave_style)
 
+            live_var = tk.BooleanVar(value=self._live_preview)
+            def _on_live():
+                self._live_preview = live_var.get()
+                self._save_config()
+            add_toggle(rec_card, "Live preview", live_var, _on_live)
+
+            font_choices = [
+                "Segoe UI", "Cascadia Code", "Consolas", "Calibri",
+                "Arial", "Verdana", "Tahoma", "Trebuchet MS",
+                "Georgia", "Cambria", "Palatino Linotype",
+                "Comic Sans MS", "Courier New", "Lucida Console",
+            ]
+            font_var = tk.StringVar(value=self._display_font)
+            def _on_font(v):
+                self._display_font = v
+                self.bubble.set_display_font(v)
+                self._save_config()
+            add_dropdown(rec_card, "Font", font_var, font_choices, command=_on_font)
+
             # -- Model card --
             model_card = make_card(left)
             model_card.pack(fill="x", pady=(0, 8))
@@ -2102,6 +2803,57 @@ class WhisperTray:
                                     anchor="w", command=_on_style_toggle)
                 cb.pack(fill="x", padx=(12, 0))
 
+            # -- Features card --
+            feat_card = make_card(right)
+            feat_card.pack(fill="x", pady=(0, 8))
+            section_label(feat_card, "Features")
+
+            autopunct_var = tk.BooleanVar(value=self._auto_punctuate)
+            def _on_autopunct():
+                self._auto_punctuate = autopunct_var.get()
+                self._save_config()
+            add_toggle(feat_card, "Auto-punctuate", autopunct_var, _on_autopunct)
+
+            conf_var = tk.BooleanVar(value=self._confidence_coloring)
+            def _on_conf():
+                self._confidence_coloring = conf_var.get()
+                self._save_config()
+            add_toggle(feat_card, "Confidence coloring", conf_var, _on_conf)
+
+            scratch_var = tk.BooleanVar(value=self._scratch_that)
+            def _on_scratch():
+                self._scratch_that = scratch_var.get()
+                self._save_config()
+            add_toggle(feat_card, "\"Scratch that\" undo", scratch_var, _on_scratch)
+
+            idle_var = tk.BooleanVar(value=self._idle_breathing)
+            def _on_idle():
+                self._idle_breathing = idle_var.get()
+                self._save_config()
+                if self._idle_breathing and not self._recording:
+                    self.bubble.start_idle_breathing()
+                elif not self._idle_breathing:
+                    self.bubble.stop_idle_breathing()
+            add_toggle(feat_card, "Idle breathing animation", idle_var, _on_idle)
+
+            tray_viz_var = tk.BooleanVar(value=self._tray_visualizer)
+            def _on_tray_viz():
+                self._tray_visualizer = tray_viz_var.get()
+                self._save_config()
+                if self._tray_visualizer and not self._recording:
+                    self._start_tray_idle()
+                elif not self._tray_visualizer:
+                    self._stop_tray_animations()
+            add_toggle(feat_card, "Tray visualizer", tray_viz_var, _on_tray_viz)
+
+            dict_hotkey_var = tk.StringVar(value=self._dictation_hotkey)
+            def _on_dict_hotkey(v):
+                self._dictation_hotkey = v
+                self._save_config()
+                threading.Thread(target=self._register_hotkey, daemon=True).start()
+            add_dropdown(feat_card, "Dictation hotkey", dict_hotkey_var,
+                         HOTKEY_OPTIONS, command=_on_dict_hotkey)
+
             # ── Close button ──
             btn_frame = tk.Frame(win, bg=BG)
             btn_frame.pack(fill="x", padx=16, pady=(4, 16))
@@ -2193,6 +2945,11 @@ class WhisperTray:
         # Start overlay bubble with live FFT feed
         self.bubble = Bubble(fft_callback=self.get_fft_bars)
         self.bubble.waveform_style = self._waveform_style
+        self.bubble.set_display_font(self._display_font)
+
+        # Start idle animations if enabled
+        if self._idle_breathing:
+            self.bubble.start_idle_breathing()
 
         # Audio stream setup
         self._sd = sd
@@ -2220,6 +2977,10 @@ class WhisperTray:
             "Whisper STT (Ready)",
         )
         self._rebuild_tray_menu()
+
+        # Start tray idle animation if enabled
+        if self._tray_visualizer:
+            self._start_tray_idle()
 
         print(f"[TRAY ] Running in system tray. Hold {self._hotkey.upper()} to record.")
         self.tray.run()
