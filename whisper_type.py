@@ -169,6 +169,13 @@ LLM_DEFAULT_PROMPT = "Minimal"
 
 NUM_BARS = 10
 FFT_CHUNK = 2048  # samples for FFT (~128ms at 16kHz)
+
+# --- Color themes ---
+THEMES = {
+    "Synthwave": (255, 46, 150),    # hot pink / magenta
+    "Windows Theme": None,           # filled dynamically from registry
+}
+THEME_DEFAULT = "Synthwave"
 CHIME_RATE = 44100  # sample rate for chime playback
 DICTATION_HOTKEY = "alt+d"  # Default dictation toggle key
 
@@ -273,7 +280,7 @@ def make_tray_fft_icon(bar_heights, accent_rgb=None, dim=False):
     # Dark circular background
     draw.ellipse([2, 2, size - 2, size - 2], fill=(20, 22, 30, 220))
 
-    ar, ag, ab = accent_rgb or _ACCENT_RGB
+    ar, ag, ab = accent_rgb or getattr(Bubble, '_theme_rgb', _ACCENT_RGB)
     ah, as_, av = colorsys.rgb_to_hsv(ar / 255, ag / 255, ab / 255)
     if dim:
         av *= 0.5
@@ -320,11 +327,118 @@ def _get_windows_accent_color():
 # Cache the accent color at import time (avoids registry reads every frame)
 _ACCENT_RGB = _get_windows_accent_color()
 
+# --- Metal frame asset ---
+_metal_frame_cache = {}
 
-def draw_waveform(size=70, color=None, bar_heights=None, style="Bars"):
-    """Draw FFT inside a glassy pill capsule, tinted with Windows accent color.
+def _load_metal_frame(target_w, target_h):
+    """Procedurally render a brushed-metal frame at exact target size.
 
-    style: "Bars" for discrete rounded bars, "Wave" for smooth filled waveform.
+    Inspired by Assets/metal_frame.svg — top-lit metallic border with bevel.
+    Returns (frame_image, interior_bbox) where interior_bbox is
+    (x_start, y_start, x_end, y_end) of the transparent interior.
+    """
+    cache_key = (target_w, target_h)
+    if cache_key in _metal_frame_cache:
+        return _metal_frame_cache[cache_key]
+
+    from PIL import Image, ImageDraw, ImageFilter
+
+    # Render at 2x for supersampled anti-aliasing, then downsample
+    S = 2
+    W, H = target_w * S, target_h * S
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # Frame geometry (in 2x space)
+    border = max(6, int(H * 0.11))
+    radius = max(6, int(H * 0.14))
+    inner_radius = max(3, radius - 3)
+
+    # --- Outer dark edge ---
+    outer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(outer).rounded_rectangle(
+        [0, 0, W - 1, H - 1], radius=radius, fill=(35, 35, 38, 200))
+    img = Image.alpha_composite(img, outer)
+
+    # --- Main metal body with vertical gradient (top-lit) ---
+    metal = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    metal_d = ImageDraw.Draw(metal)
+    metal_d.rounded_rectangle([2, 2, W - 3, H - 3], radius=radius,
+                              fill=(255, 255, 255, 255))
+    # Build shape mask for the metal body
+    shape_alpha = np.array(metal)[:, :, 3]
+    # Apply vertical gradient: bright top -> dark bottom
+    metal_arr = np.array(metal)
+    for y in range(H):
+        t = y / max(H - 1, 1)
+        gray = int(155 - 105 * t)
+        mask = metal_arr[y, :, 3] > 0
+        metal_arr[y, mask, 0] = gray
+        metal_arr[y, mask, 1] = gray
+        metal_arr[y, mask, 2] = gray + 2
+
+    # Brushed-metal noise (masked to frame shape only)
+    noise = np.random.default_rng(42).integers(0, 25, (H, W), dtype=np.uint8)
+    metal_arr[:, :, 0] = np.clip(metal_arr[:, :, 0].astype(np.int16) + noise - 12, 0, 255).astype(np.uint8)
+    metal_arr[:, :, 1] = np.clip(metal_arr[:, :, 1].astype(np.int16) + noise - 12, 0, 255).astype(np.uint8)
+    metal_arr[:, :, 2] = np.clip(metal_arr[:, :, 2].astype(np.int16) + noise - 12, 0, 255).astype(np.uint8)
+    # Zero out noise outside the shape
+    metal_arr[shape_alpha == 0] = (0, 0, 0, 0)
+    metal = Image.fromarray(metal_arr, "RGBA")
+
+    img = Image.alpha_composite(img, metal)
+
+    # --- Cut out interior (transparent center) ---
+    ix0 = border + 2
+    iy0 = border + 2
+    ix1 = W - border - 3
+    iy1 = H - border - 3
+    cutout_arr = np.array(img)
+    cut_mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(cut_mask).rounded_rectangle(
+        [ix0, iy0, ix1, iy1], radius=inner_radius, fill=255)
+    cutout_arr[np.array(cut_mask) > 128] = (0, 0, 0, 0)
+    img = Image.fromarray(cutout_arr, "RGBA")
+
+    # --- Inner bevel: bright top edge, dark bottom edge ---
+    bevel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    bevel_d = ImageDraw.Draw(bevel)
+    bevel_d.rounded_rectangle([ix0 - 1, iy0 - 1, ix1 + 1, iy0 + 2],
+                              radius=max(2, inner_radius - 1),
+                              fill=(180, 180, 185, 120))
+    bevel_d.rounded_rectangle([ix0 - 1, iy1 - 2, ix1 + 1, iy1 + 1],
+                              radius=max(2, inner_radius - 1),
+                              fill=(15, 15, 18, 140))
+    bevel = bevel.filter(ImageFilter.GaussianBlur(radius=2))
+    img = Image.alpha_composite(img, bevel)
+
+    # --- Top shine across the frame ---
+    shine = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(shine).rounded_rectangle(
+        [3, 3, W - 4, H // 3], radius=radius, fill=(255, 255, 255, 25))
+    shine = shine.filter(ImageFilter.GaussianBlur(radius=3))
+    img = Image.alpha_composite(img, shine)
+
+    # --- Downsample to target size ---
+    img = img.resize((target_w, target_h), Image.LANCZOS)
+
+    # Compute interior bbox in target coordinates
+    ix0_t = round(ix0 / S)
+    iy0_t = round(iy0 / S)
+    ix1_t = round(ix1 / S)
+    iy1_t = round(iy1 / S)
+
+    result = (img, (ix0_t, iy0_t, ix1_t, iy1_t))
+    _metal_frame_cache[cache_key] = result
+    return result
+
+
+def draw_waveform(size=70, color=None, bar_heights=None, style="Bars", color_rgb=None,
+                  cells_per_bar=4):
+    """Draw FFT inside a metal frame, tinted with theme color.
+
+    color_rgb: (r, g, b) tuple for bar colors. Falls back to _ACCENT_RGB.
+    style: "Bars" for discrete rounded bars, "Pixel" for LED matrix, "Wave" for smooth waveform.
+    cells_per_bar: number of LED cells per half-bar in Pixel mode.
     """
     from PIL import Image, ImageDraw, ImageFilter
     import colorsys
@@ -333,72 +447,64 @@ def draw_waveform(size=70, color=None, bar_heights=None, style="Bars"):
     if bar_heights is None:
         bar_heights = [0.15] * NUM_BARS
 
-    ar, ag, ab = _ACCENT_RGB
+    ar, ag, ab = color_rgb or _ACCENT_RGB
     # Derive accent hue for color variations
     ah, as_, av = colorsys.rgb_to_hsv(ar / 255, ag / 255, ab / 255)
 
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # --- Pill capsule shell ---
-    border = 2
-    radius = H // 2
-
-    # Outer glow tinted with accent
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    glow_draw = ImageDraw.Draw(glow)
-    glow_draw.rounded_rectangle(
-        [0, 0, W - 1, H - 1], radius=radius,
-        fill=(ar, ag, ab, 25),
-    )
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=5))
-    img = Image.alpha_composite(img, glow)
-    draw = ImageDraw.Draw(img)
-
-    # Capsule border (subtle, accent-tinted)
-    br = int(200 + (ar - 128) * 0.2)
-    bg_ = int(200 + (ag - 128) * 0.2)
-    bb = int(200 + (ab - 128) * 0.2)
-    draw.rounded_rectangle(
-        [0, 0, W - 1, H - 1], radius=radius,
-        fill=(min(235, br), min(235, bg_), min(235, bb), 160),
-        outline=(min(210, br - 20), min(210, bg_ - 20), min(210, bb - 20), 180), width=2,
-    )
-
-    # Inner capsule fill (dark translucent)
-    inner_margin = border + 2
-    draw.rounded_rectangle(
-        [inner_margin, inner_margin, W - 1 - inner_margin, H - 1 - inner_margin],
-        radius=radius - inner_margin,
-        fill=(12, 14, 22, 210),
-    )
-
-    # Glass highlight on top edge
-    highlight = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    hl_draw = ImageDraw.Draw(highlight)
-    hl_draw.rounded_rectangle(
-        [inner_margin + 3, inner_margin + 1,
-         W - 1 - inner_margin - 3, H // 3],
-        radius=(radius - inner_margin) // 2,
-        fill=(255, 255, 255, 22),
-    )
-    highlight = highlight.filter(ImageFilter.GaussianBlur(radius=2))
-    img = Image.alpha_composite(img, highlight)
-    draw = ImageDraw.Draw(img)
-
-    # --- FFT content (mirrored from center) ---
-    pad_x = int(W * 0.08)
-    wave_w = W - 2 * pad_x
-    cy = H // 2
-    half_max = int(H * 0.38)
+    # --- FFT content (centered within the metal frame interior) ---
+    frame_img, (ix0, iy0, ix1, iy1) = _load_metal_frame(W, H)
+    inset = 2  # small extra inset from frame edges
+    pad_x = ix0 + inset
+    wave_w = (ix1 - ix0) - 2 * inset
+    cy = (iy0 + iy1) // 2
+    half_max = int((iy1 - iy0) * 0.40)
     num_bars = len(bar_heights)
 
-    if style == "Bars":
-        # Discrete rounded bars
-        gap_ratio = 0.35
+    if style == "Pixel":
+        # --- LED matrix: separate pipeline, no rounding, no glow ---
+        gap_ratio = 0.45
         bar_w = wave_w / (num_bars + (num_bars - 1) * gap_ratio)
         gap = bar_w * gap_ratio
-        bar_radius = max(2, int(bar_w / 3))
+        # Cell sizing: 2px gap drawn as dark lines for visibility at any scale
+        cell_gap = 2
+        cell_h = max(2, (half_max - (cells_per_bar - 1) * cell_gap) // cells_per_bar)
+        cell_step = cell_h + cell_gap
+
+        for i, bh in enumerate(bar_heights):
+            t = (i + 0.5) / num_bars
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            edge_dim = 1.0 - 0.15 * abs(t - 0.5) * 2
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.9), min(1.0, av * edge_dim))
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+            # Dimmed color for "unlit" cells
+            rd, gd, bd = int(r * 0.15), int(g * 0.15), int(b * 0.15)
+
+            x0 = int(pad_x + i * (bar_w + gap))
+            x1 = int(x0 + bar_w)
+            lit = max(1, round(cells_per_bar * max(0.05, bh)))
+            # Draw all cells: lit ones bright, unlit ones dim
+            for c in range(cells_per_bar):
+                is_lit = c < lit
+                cr, cg, cb = (r, g, b) if is_lit else (rd, gd, bd)
+                y_off = c * cell_step
+                # Top half (above center)
+                draw.rectangle([x0, cy - y_off - cell_h, x1, cy - y_off],
+                               fill=(cr, cg, cb, 255))
+                # Bottom half (below center)
+                draw.rectangle([x0, cy + y_off, x1, cy + y_off + cell_h],
+                               fill=(cr, cg, cb, 255))
+
+    elif style == "Bars":
+        # --- Smooth rounded bars with glow ---
+        gap_ratio = 0.85
+        bar_w = wave_w / (num_bars + (num_bars - 1) * gap_ratio)
+        gap = bar_w * gap_ratio
+        # Base radius from bar width (pill shape)
+        base_radius = max(2, int(bar_w / 3))
 
         for i, bh in enumerate(bar_heights):
             t = (i + 0.5) / num_bars
@@ -408,15 +514,19 @@ def draw_waveform(size=70, color=None, bar_heights=None, style="Bars"):
             rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.9), min(1.0, av * edge_dim))
             r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
 
-            col_h = max(3, int(half_max * max(0.05, bh)))
+            col_h = max(2, int(half_max * max(0.05, bh)))
             x = pad_x + i * (bar_w + gap)
+            # Cap radius so short bars stay rectangular, not circular
+            radius = min(base_radius, col_h)
             draw.rounded_rectangle(
                 [x, cy - col_h, x + bar_w, cy + col_h],
-                radius=bar_radius,
+                radius=radius,
                 fill=(r, g, b, 230),
             )
 
-        # Bar glow
+        # Bar glow (scaled to pill size)
+        glow_r = max(1, min(3, half_max // 6))
+        dot_r = max(1, min(3, int(bar_w / 3)))
         bar_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         bg_draw = ImageDraw.Draw(bar_glow)
         for i, bh in enumerate(bar_heights):
@@ -427,9 +537,9 @@ def draw_waveform(size=70, color=None, bar_heights=None, style="Bars"):
             r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
             col_h = max(3, int(half_max * max(0.05, bh)))
             x = pad_x + i * (bar_w + gap) + bar_w / 2
-            bg_draw.ellipse([x - 3, cy - col_h - 3, x + 3, cy - col_h + 3], fill=(r, g, b, 70))
-            bg_draw.ellipse([x - 3, cy + col_h - 3, x + 3, cy + col_h + 3], fill=(r, g, b, 70))
-        bar_glow = bar_glow.filter(ImageFilter.GaussianBlur(radius=3))
+            bg_draw.ellipse([x - dot_r, cy - col_h - dot_r, x + dot_r, cy - col_h + dot_r], fill=(r, g, b, 50))
+            bg_draw.ellipse([x - dot_r, cy + col_h - dot_r, x + dot_r, cy + col_h + dot_r], fill=(r, g, b, 50))
+        bar_glow = bar_glow.filter(ImageFilter.GaussianBlur(radius=glow_r))
         img = Image.alpha_composite(img, bar_glow)
 
     else:
@@ -476,6 +586,9 @@ def draw_waveform(size=70, color=None, bar_heights=None, style="Bars"):
         wave_glow = wave_glow.filter(ImageFilter.GaussianBlur(radius=3))
         img = Image.alpha_composite(img, wave_glow)
 
+    # --- Composite metal frame on top of FFT bars ---
+    img = Image.alpha_composite(img, frame_img)
+
     # --- Flatten alpha for Windows color-key transparency ---
     # Tkinter's -transparentcolor is binary (no partial transparency),
     # so semi-transparent glow pixels would show as dark fringe on light
@@ -504,17 +617,33 @@ class Bubble:
     """A small popup at bottom-center of the screen."""
 
     _accent_hex = "#{:02x}{:02x}{:02x}".format(*_ACCENT_RGB)
+    _theme_rgb = _ACCENT_RGB  # active theme color as (r, g, b)
     COLORS = {
         "recording":    {"bg": _accent_hex, "fg": "#FFFFFF"},
         "transcribing": {"bg": _accent_hex, "fg": "#FFFFFF"},
         "result":       {"bg": _accent_hex, "fg": "#FFFFFF"},
     }
 
+    @classmethod
+    def set_theme(cls, theme_name):
+        """Update the active color theme."""
+        rgb = THEMES.get(theme_name)
+        if rgb is None:
+            # "Windows Theme" — re-read live from registry
+            rgb = _get_windows_accent_color()
+        cls._theme_rgb = rgb
+        cls._accent_hex = "#{:02x}{:02x}{:02x}".format(*rgb)
+        cls.COLORS = {
+            "recording":    {"bg": cls._accent_hex, "fg": "#FFFFFF"},
+            "transcribing": {"bg": cls._accent_hex, "fg": "#FFFFFF"},
+            "result":       {"bg": cls._accent_hex, "fg": "#FFFFFF"},
+        }
+
     FADE_STEPS  = 12
     FADE_MS     = 16
     MAX_ALPHA   = 0.92
     TRANSPARENT = "#010101"
-    MIC_SIZE    = 55
+    MIC_SIZE    = 41
 
     def __init__(self, fft_callback=None):
         self._root = None
@@ -539,7 +668,9 @@ class Bubble:
     def _build_waveform_photo(self, color_hex, bar_heights=None):
         from PIL import ImageTk
         pil_img = draw_waveform(size=self.MIC_SIZE, color=color_hex, bar_heights=bar_heights,
-                                style=getattr(self, "waveform_style", "Bars"))
+                                style=getattr(self, "waveform_style", "Bars"),
+                                color_rgb=self._theme_rgb,
+                                cells_per_bar=getattr(self, "cells_per_bar", 4))
         photo = ImageTk.PhotoImage(pil_img)
         return photo
 
@@ -679,8 +810,11 @@ class Bubble:
         def _tick():
             if self._fft_callback:
                 raw = self._fft_callback()
+                # Resize smooth bars if bar count changed
+                if len(self._smooth_bars) != len(raw):
+                    self._smooth_bars = [0.15] * len(raw)
                 # Exponential smoothing for fluid bar motion
-                for i in range(NUM_BARS):
+                for i in range(len(raw)):
                     self._smooth_bars[i] += (raw[i] - self._smooth_bars[i]) * (1.0 - SMOOTHING)
                 photo = self._build_waveform_photo(color_hex, bar_heights=self._smooth_bars)
                 self._mic_label.config(image=photo)
@@ -1084,6 +1218,9 @@ class Bubble:
             self._root.attributes("-transparentcolor", self.TRANSPARENT)
             self._mic_label.config(bg=self.TRANSPARENT)
             self._mic_label.pack()
+            # Pack invisible timer spacer so idle height matches recording height
+            self._timer_label.config(text=" ", fg=self.TRANSPARENT, bg=self.TRANSPARENT)
+            self._timer_label.pack()
 
             self._root.deiconify()
             self._root.lift()
@@ -1097,7 +1234,7 @@ class Bubble:
     def _idle_breathing_tick(self):
         import math
         self._idle_phase = getattr(self, "_idle_phase", 0.0) + 0.1
-        bars = _breathing_bars(self._idle_phase)
+        bars = _breathing_bars(self._idle_phase, num_bars=getattr(self, 'num_bars', NUM_BARS))
         photo = self._build_waveform_photo(self._accent_hex, bar_heights=bars)
         self._mic_label.config(image=photo)
         self._mic_label._idle_photo = photo
@@ -1162,7 +1299,10 @@ class WhisperTray:
         self._translate_lang = None  # None = off, "Spanish" etc = on
         self._bubble_duration = BUBBLE_DURATION
         self._privacy_mic = PRIVACY_MIC
-        self._waveform_style = "Bars"  # "Bars" or "Wave"
+        self._waveform_style = "Bars"  # "Bars", "Pixel", or "Wave"
+        self._color_theme = THEME_DEFAULT  # "Synthwave", "Windows Theme", etc.
+        self._num_bars = NUM_BARS  # Number of FFT bars to display
+        self._cells_per_bar = 4   # LED cells per half-bar in Pixel mode
         self._display_font = "Segoe UI"  # Font for result text, timer, preview
         self._live_preview = False  # Show live transcription while recording
         self._live_stop = threading.Event()
@@ -1224,6 +1364,9 @@ class WhisperTray:
             self._bubble_duration = cfg.get("bubble_duration", self._bubble_duration)
             self._privacy_mic = cfg.get("privacy_mic", self._privacy_mic)
             self._waveform_style = cfg.get("waveform_style", self._waveform_style)
+            self._color_theme = cfg.get("color_theme", self._color_theme)
+            self._num_bars = cfg.get("num_bars", self._num_bars)
+            self._cells_per_bar = cfg.get("cells_per_bar", self._cells_per_bar)
             self._display_font = cfg.get("display_font", self._display_font)
             self._live_preview = cfg.get("live_preview", self._live_preview)
             self._auto_punctuate = cfg.get("auto_punctuate", self._auto_punctuate)
@@ -1265,6 +1408,9 @@ class WhisperTray:
             "bubble_duration": self._bubble_duration,
             "privacy_mic": self._privacy_mic,
             "waveform_style": self._waveform_style,
+            "color_theme": self._color_theme,
+            "num_bars": self._num_bars,
+            "cells_per_bar": self._cells_per_bar,
             "display_font": self._display_font,
             "live_preview": self._live_preview,
             "auto_punctuate": self._auto_punctuate,
@@ -1461,12 +1607,13 @@ class WhisperTray:
             self._viz_buffer[-n:] = mono
 
     def get_fft_bars(self):
+        n = self._num_bars
         window = np.hanning(FFT_CHUNK)
         spectrum = np.abs(np.fft.rfft(self._viz_buffer * window))
         freqs = np.fft.rfftfreq(FFT_CHUNK, 1.0 / SAMPLE_RATE)
-        edges = np.logspace(np.log10(60), np.log10(7500), NUM_BARS + 1)
+        edges = np.logspace(np.log10(60), np.log10(7500), n + 1)
         bars = []
-        for i in range(NUM_BARS):
+        for i in range(n):
             mask = (freqs >= edges[i]) & (freqs < edges[i + 1])
             if mask.any():
                 bars.append(float(np.mean(spectrum[mask])))
@@ -2644,7 +2791,33 @@ class WhisperTray:
                 self.bubble.waveform_style = v
                 self._save_config()
             add_dropdown(rec_card, "Visualizer", wave_style_var,
-                         ["Bars", "Wave"], command=_on_wave_style)
+                         ["Bars", "Pixel", "Wave"], command=_on_wave_style)
+
+            bars_var = tk.StringVar(value=str(self._num_bars))
+            def _on_bars(v):
+                self._num_bars = int(v)
+                self.bubble.num_bars = int(v)
+                self._save_config()
+            add_dropdown(rec_card, "Bar count", bars_var,
+                         ["6", "8", "10", "12", "16", "20", "24", "32"],
+                         command=_on_bars)
+
+            cells_var = tk.StringVar(value=str(self._cells_per_bar))
+            def _on_cells(v):
+                self._cells_per_bar = int(v)
+                self.bubble.cells_per_bar = int(v)
+                self._save_config()
+            add_dropdown(rec_card, "Cells per bar", cells_var,
+                         ["2", "3", "4", "5", "6", "8"],
+                         command=_on_cells)
+
+            theme_var = tk.StringVar(value=self._color_theme)
+            def _on_theme(v):
+                self._color_theme = v
+                Bubble.set_theme(v)
+                self._save_config()
+            add_dropdown(rec_card, "Color theme", theme_var,
+                         list(THEMES.keys()), command=_on_theme)
 
             live_var = tk.BooleanVar(value=self._live_preview)
             def _on_live():
@@ -2944,7 +3117,10 @@ class WhisperTray:
 
         # Start overlay bubble with live FFT feed
         self.bubble = Bubble(fft_callback=self.get_fft_bars)
+        Bubble.set_theme(self._color_theme)
         self.bubble.waveform_style = self._waveform_style
+        self.bubble.num_bars = self._num_bars
+        self.bubble.cells_per_bar = self._cells_per_bar
         self.bubble.set_display_font(self._display_font)
 
         # Start idle animations if enabled
