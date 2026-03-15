@@ -26,8 +26,10 @@ import http.client
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse
+import asyncio
 import tkinter as tk
 import numpy as np
+import websockets
 
 # --- Session log ---
 _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session.log")
@@ -178,6 +180,7 @@ THEMES = {
 THEME_DEFAULT = "Synthwave"
 CHIME_RATE = 44100  # sample rate for chime playback
 DICTATION_HOTKEY = "alt+d"  # Default dictation toggle key
+WS_PORT = 5001               # WebSocket bridge port for dashboard integration
 
 
 def _generate_chime(freq, duration=0.12, volume=0.3, fade=0.03):
@@ -1262,6 +1265,97 @@ class Bubble:
 
 
 # ---------------------------------------------
+#  WebSocket bridge for dashboard integration
+# ---------------------------------------------
+class WebSocketBridge:
+    """WebSocket server that bridges whisper transcriptions to external apps."""
+
+    def __init__(self, port=WS_PORT):
+        self.port = port
+        self.clients = set()
+        self.loop = None
+        self.server = None
+        self._recording = False
+
+    @property
+    def has_clients(self):
+        return len(self.clients) > 0
+
+    async def _handler(self, websocket):
+        self.clients.add(websocket)
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+                    if msg_type == "start_recording":
+                        self._on_start_recording()
+                    elif msg_type == "stop_recording":
+                        self._on_stop_recording()
+                except json.JSONDecodeError:
+                    pass
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            self.clients.discard(websocket)
+
+    async def _serve(self):
+        try:
+            self.server = await websockets.serve(
+                self._handler, "localhost", self.port
+            )
+            print(f"[WS   ] WebSocket bridge listening on ws://localhost:{self.port}")
+            await self.server.wait_closed()
+        except OSError as e:
+            print(f"[WS   ] Failed to start on port {self.port}: {e}")
+
+    def start(self):
+        """Start the WebSocket server in a daemon thread."""
+        def _run():
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self._serve())
+
+        thread = threading.Thread(target=_run, daemon=True, name="ws-bridge")
+        thread.start()
+
+    def broadcast(self, message_dict):
+        """Send a JSON message to all connected clients."""
+        if not self.clients or not self.loop:
+            return
+        data = json.dumps(message_dict)
+        for client in list(self.clients):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    client.send(data), self.loop
+                )
+            except Exception:
+                self.clients.discard(client)
+
+    def broadcast_transcription(self, text):
+        """Broadcast a transcription result."""
+        self.broadcast({"type": "transcription", "text": text})
+
+    def broadcast_recording_started(self):
+        """Notify clients that recording has begun."""
+        self._recording = True
+        self.broadcast({"type": "recording_started"})
+
+    def broadcast_recording_stopped(self):
+        """Notify clients that recording has stopped."""
+        self._recording = False
+        self.broadcast({"type": "recording_stopped"})
+
+    def broadcast_error(self, message):
+        """Notify clients of an error."""
+        self.broadcast({"type": "error", "message": message})
+
+    # Callbacks set by WhisperTray
+    _on_start_recording = staticmethod(lambda: None)
+    _on_stop_recording = staticmethod(lambda: None)
+
+
+# ---------------------------------------------
 #  Main app
 # ---------------------------------------------
 class WhisperTray:
@@ -1338,8 +1432,21 @@ class WhisperTray:
         self._nav_hooks = []  # Multi-Model Preview keyboard hooks
         self._ollama_ready = threading.Event()
         self._ollama_ready.set()  # Ready by default (no warm-up pending)
+        # WebSocket bridge port
+        self._ws_port = WS_PORT
         # Load saved settings (overrides defaults above)
         self._load_config()
+        # WebSocket bridge for dashboard integration
+        self.ws_bridge = WebSocketBridge(port=self._ws_port)
+        # Wire recording control callbacks — go through on_key_down/on_key_up
+        # for guard logic, but dispatch to background threads to avoid blocking
+        # the asyncio event loop
+        self.ws_bridge._on_start_recording = lambda: threading.Thread(
+            target=self.on_key_down, daemon=True, name="ws-rec-start"
+        ).start()
+        self.ws_bridge._on_stop_recording = lambda: threading.Thread(
+            target=self.on_key_up, daemon=True, name="ws-rec-stop"
+        ).start()
 
     def _load_config(self):
         """Load persistent settings from JSON config file."""
@@ -1375,6 +1482,7 @@ class WhisperTray:
             self._idle_breathing = cfg.get("idle_breathing", self._idle_breathing)
             self._tray_visualizer = cfg.get("tray_visualizer", self._tray_visualizer)
             self._dictation_hotkey = cfg.get("dictation_hotkey", self._dictation_hotkey)
+            self._ws_port = cfg.get("ws_port", self._ws_port)
             # Load custom prompts into LLM_PROMPTS
             for name, template in cfg.get("custom_prompts", {}).items():
                 LLM_PROMPTS[name] = template
@@ -1419,6 +1527,7 @@ class WhisperTray:
             "idle_breathing": self._idle_breathing,
             "tray_visualizer": self._tray_visualizer,
             "dictation_hotkey": self._dictation_hotkey,
+            "ws_port": self._ws_port,
             "cuda_verified": getattr(self, "_cuda_verified", False),
         }
         # Preserve custom_prompts if they exist in the file
@@ -3157,6 +3266,9 @@ class WhisperTray:
         # Start tray idle animation if enabled
         if self._tray_visualizer:
             self._start_tray_idle()
+
+        # Start WebSocket bridge for dashboard integration
+        self.ws_bridge.start()
 
         print(f"[TRAY ] Running in system tray. Hold {self._hotkey.upper()} to record.")
         self.tray.run()
