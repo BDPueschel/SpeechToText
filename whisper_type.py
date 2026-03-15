@@ -1967,6 +1967,11 @@ class WhisperTray:
         return results
 
     def paste_text(self, text):
+        # Dashboard mode: broadcast via WebSocket, skip clipboard/paste
+        if self.ws_bridge.has_clients:
+            self.ws_bridge.broadcast_transcription(text)
+            return
+
         import pyperclip
         import pyautogui
         pyperclip.copy(text)
@@ -2173,6 +2178,9 @@ class WhisperTray:
             self.bubble.show("0:00", style="recording")
             self.play_chime(CHIME_START)
             self._start_recording_timer()
+            # Notify WebSocket clients that recording has started
+            if self.ws_bridge.has_clients:
+                self.ws_bridge.broadcast_recording_started()
             # Start live transcription preview if enabled
             if self._live_preview:
                 self._live_stop.clear()
@@ -2208,6 +2216,10 @@ class WhisperTray:
         if self._cancel_requested:
             self._cancel_requested = False
             return
+
+        # Notify WebSocket clients that recording has stopped
+        if self.ws_bridge.has_clients:
+            self.ws_bridge.broadcast_recording_stopped()
 
         # Wait for any in-flight live transcription to finish before starting
         # the final transcription — concurrent model.transcribe() calls produce
@@ -2259,12 +2271,20 @@ class WhisperTray:
 
         def _do_transcribe():
             log.debug("_do_transcribe START")
-            if audio_np is not None:
-                log.debug("transcribe_streaming START")
-                post_text = self.transcribe_streaming(audio_np)
-                log.debug(f"transcribe_streaming DONE: '{post_text[:80] if post_text else ''}'")
-            else:
-                post_text = ""
+            try:
+                if audio_np is not None:
+                    log.debug("transcribe_streaming START")
+                    post_text = self.transcribe_streaming(audio_np)
+                    log.debug(f"transcribe_streaming DONE: '{post_text[:80] if post_text else ''}'")
+                else:
+                    post_text = ""
+            except Exception as e:
+                log.exception("Transcription failed")
+                if self.ws_bridge.has_clients:
+                    self.ws_bridge.broadcast_error(str(e))
+                self.set_icon(self.COLOR_READY)
+                self.bubble.show("Transcription error", style="transcribing", duration=2.0)
+                return
 
             # Combine scratch prefix with post-scratch transcription
             if scratch_prefix and post_text:
