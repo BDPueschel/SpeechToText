@@ -257,10 +257,24 @@ def auto_punctuate(text):
     return text
 
 
-def _breathing_bars(phase, num_bars=NUM_BARS, amplitude=0.08, base=0.12, spacing=0.4):
-    """Generate gentle sine-wave bar heights for idle breathing animation."""
+def _breathing_bars(phase, num_bars=NUM_BARS):
+    """Generate sine-wave bar heights for idle breathing animation.
+
+    A visible sine wave travels across the bars, modulated by a slow
+    breath envelope so it swells and recedes.
+    """
     import math
-    return [base + amplitude * math.sin(phase + i * spacing) for i in range(num_bars)]
+    # Slow breath envelope scales the wave: 0.4 … 1.0
+    breath = 0.4 + 0.6 * (0.5 + 0.5 * math.cos(phase * 0.4))
+    # Sine wave across bars — large enough to see the wave shape
+    base = 0.12
+    wave_amp = 0.55
+    spacing = 0.7
+    return [
+        max(0.06, base + wave_amp * breath *
+            (0.5 + 0.5 * math.sin(phase * 1.1 + i * spacing)))
+        for i in range(num_bars)
+    ]
 
 
 def make_icon_image(color):
@@ -1235,13 +1249,12 @@ class Bubble:
         self._root.after(0, _start)
 
     def _idle_breathing_tick(self):
-        import math
-        self._idle_phase = getattr(self, "_idle_phase", 0.0) + 0.1
+        self._idle_phase = getattr(self, "_idle_phase", 0.0) + 0.15
         bars = _breathing_bars(self._idle_phase, num_bars=getattr(self, 'num_bars', NUM_BARS))
         photo = self._build_waveform_photo(self._accent_hex, bar_heights=bars)
         self._mic_label.config(image=photo)
         self._mic_label._idle_photo = photo
-        self._idle_anim_job = self._root.after(80, self._idle_breathing_tick)
+        self._idle_anim_job = self._root.after(60, self._idle_breathing_tick)
 
     def stop_idle_breathing(self):
         """Stop idle breathing animation."""
@@ -1497,6 +1510,31 @@ class WhisperTray:
             pass
         except Exception as e:
             print(f"[CONF ] Failed to load config: {e}")
+
+    # -- Windows accent color polling ----------------------------------------
+    _ACCENT_POLL_SEC = 30
+
+    def _start_accent_poll(self):
+        """Begin periodic polling for Windows accent color changes."""
+        self._accent_poll_timer = threading.Timer(self._ACCENT_POLL_SEC, self._poll_accent_color)
+        self._accent_poll_timer.daemon = True
+        self._accent_poll_timer.start()
+
+    def _poll_accent_color(self):
+        """Check if the Windows accent color changed; update theme if so."""
+        try:
+            if self._color_theme != "Windows Theme":
+                return  # only poll when tracking the system theme
+            fresh = _get_windows_accent_color()
+            if fresh != Bubble._theme_rgb:
+                Bubble.set_theme("Windows Theme")
+        except Exception:
+            pass
+        finally:
+            # Re-arm the timer
+            self._accent_poll_timer = threading.Timer(self._ACCENT_POLL_SEC, self._poll_accent_color)
+            self._accent_poll_timer.daemon = True
+            self._accent_poll_timer.start()
 
     def _save_config(self):
         """Persist current settings to JSON config file."""
@@ -2162,9 +2200,9 @@ class WhisperTray:
 
     def _do_key_down(self):
         try:
-            log.debug("_do_key_down START"); sys.stdout.flush()
+            log.debug("_do_key_down START")
             if self._privacy_mic:
-                log.debug("_do_key_down: opening stream"); sys.stdout.flush()
+                log.debug("_do_key_down: opening stream")
                 self._open_audio_stream()
             self._cancel_requested = False
             self.audio_buffer.clear()
@@ -2187,7 +2225,7 @@ class WhisperTray:
                 threading.Thread(target=self._live_preview_loop, daemon=True, name="live-preview").start()
             # Clean up any stale debug nav hooks from previous multi-model preview
             self._cleanup_nav_hooks_async()
-            log.debug("_do_key_down DONE"); sys.stdout.flush()
+            log.debug("_do_key_down DONE")
         except Exception:
             log.exception("_do_key_down FAILED")
             self.is_recording = False
@@ -2206,7 +2244,7 @@ class WhisperTray:
         threading.Thread(target=self._do_key_up, daemon=True, name="key-up").start()
 
     def _do_key_up(self):
-        log.debug("_do_key_up START"); sys.stdout.flush()
+        log.debug("_do_key_up START")
         self.bubble.hide_preview()
         if self._privacy_mic:
             self._close_audio_stream()
@@ -2228,18 +2266,18 @@ class WhisperTray:
         self._live_transcribe_lock.release()
 
         elapsed = time.time() - self.start_time
-        log.debug(f"_do_key_up: elapsed={elapsed:.2f}, buffer={len(self.audio_buffer)}"); sys.stdout.flush()
+        log.debug(f"_do_key_up: elapsed={elapsed:.2f}, buffer={len(self.audio_buffer)}")
 
         if elapsed < 0.3 or not self.audio_buffer:
             self.set_icon(self.COLOR_READY)
             self.bubble.hide()
             return
 
-        log.debug("_do_key_up: set_icon TRANSCRIBING"); sys.stdout.flush()
+        log.debug("_do_key_up: set_icon TRANSCRIBING")
         self.set_icon(self.COLOR_TRANSCRIBING)
-        log.debug("_do_key_up: bubble show"); sys.stdout.flush()
+        log.debug("_do_key_up: bubble show")
         self.bubble.show("Transcribing...", style="transcribing")
-        log.debug("_do_key_up: concat audio"); sys.stdout.flush()
+        log.debug("_do_key_up: concat audio")
 
         # If scratch was applied during live preview, split audio at the scratch
         # boundary so the scratched content is never re-transcribed. This avoids
@@ -2454,10 +2492,10 @@ class WhisperTray:
                         if tone_emoji:
                             final_text = f"{tone_emoji} {final_text}"
                             print(f"[TONE ] {tone_emoji}")
-                    log.debug("paste_text START (single-model)"); sys.stdout.flush()
+                    log.debug("paste_text START (single-model)")
                     self.play_chime(CHIME_DONE)
                     self.paste_text(final_text)
-                    log.debug("paste_text DONE"); sys.stdout.flush()
+                    log.debug("paste_text DONE")
                     if final_text != raw_text and self._bubble_duration > 0:
                         self.bubble.show(final_text, style="compare", duration=self._bubble_duration,
                                          original=raw_text, low_confidence=low_conf)
@@ -2486,7 +2524,7 @@ class WhisperTray:
             else:
                 print("[EMPTY] Nothing transcribed.")
                 self.bubble.show("(nothing heard)", style="transcribing", duration=1.5)
-            log.debug("_do_transcribe: set_icon READY"); sys.stdout.flush()
+            log.debug("_do_transcribe: set_icon READY")
             self.set_icon(self.COLOR_READY)
             self._start_tray_idle()
             # Restart idle breathing after bubble duration
@@ -2494,7 +2532,7 @@ class WhisperTray:
                 delay = int((self._bubble_duration + 0.5) * 1000) if self._bubble_duration > 0 else 500
                 self.bubble._root.after(delay, lambda: self.bubble.start_idle_breathing()
                                         if not self.is_recording else None)
-            log.debug("_do_transcribe DONE"); sys.stdout.flush()
+            log.debug("_do_transcribe DONE")
 
         threading.Thread(target=_do_transcribe, daemon=True).start()
 
@@ -3251,6 +3289,9 @@ class WhisperTray:
         self.bubble.num_bars = self._num_bars
         self.bubble.cells_per_bar = self._cells_per_bar
         self.bubble.set_display_font(self._display_font)
+
+        # Poll Windows accent color changes (e.g. rotating themes)
+        self._start_accent_poll()
 
         # Start idle animations if enabled
         if self._idle_breathing:
