@@ -1411,6 +1411,9 @@ class WhisperTray:
         self._translate_lang = None  # None = off, "Spanish" etc = on
         self._bubble_duration = BUBBLE_DURATION
         self._privacy_mic = PRIVACY_MIC
+        self._remote_mode = REMOTE_MODE      # Route audio to Mac Mini STT server
+        self._remote_url = REMOTE_URL
+        self._remote_cleanup = REMOTE_CLEANUP
         self._waveform_style = "Bars"  # "Bars", "Pixel", or "Wave"
         self._color_theme = THEME_DEFAULT  # "Synthwave", "Windows Theme", etc.
         self._num_bars = NUM_BARS  # Number of FFT bars to display
@@ -1488,6 +1491,9 @@ class WhisperTray:
             self._translate_lang = cfg.get("translate_lang", self._translate_lang)
             self._bubble_duration = cfg.get("bubble_duration", self._bubble_duration)
             self._privacy_mic = cfg.get("privacy_mic", self._privacy_mic)
+            self._remote_mode = cfg.get("remote_mode", self._remote_mode)
+            self._remote_url = cfg.get("remote_url", self._remote_url)
+            self._remote_cleanup = cfg.get("remote_cleanup", self._remote_cleanup)
             self._waveform_style = cfg.get("waveform_style", self._waveform_style)
             self._color_theme = cfg.get("color_theme", self._color_theme)
             self._num_bars = cfg.get("num_bars", self._num_bars)
@@ -1558,6 +1564,9 @@ class WhisperTray:
             "translate_lang": self._translate_lang,
             "bubble_duration": self._bubble_duration,
             "privacy_mic": self._privacy_mic,
+            "remote_mode": self._remote_mode,
+            "remote_url": self._remote_url,
+            "remote_cleanup": self._remote_cleanup,
             "waveform_style": self._waveform_style,
             "color_theme": self._color_theme,
             "num_bars": self._num_bars,
@@ -1810,9 +1819,9 @@ class WhisperTray:
             wf.writeframes((pcm16 * 32767).astype("<i2").tobytes())
         buf.seek(0)
         resp = requests.post(
-            f"{REMOTE_URL}/transcribe",
+            f"{self._remote_url}/transcribe",
             files={"file": ("clip.wav", buf, "audio/wav")},
-            data={"cleanup": REMOTE_CLEANUP},
+            data={"cleanup": self._remote_cleanup},
             timeout=60,
         )
         resp.raise_for_status()
@@ -2336,7 +2345,7 @@ class WhisperTray:
             log.debug("_do_transcribe START")
             try:
                 if audio_np is not None:
-                    if REMOTE_MODE:
+                    if self._remote_mode:
                         try:
                             log.debug("transcribe_remote START")
                             post_text = self.transcribe_remote(audio_np)
@@ -2978,6 +2987,14 @@ class WhisperTray:
                 threading.Thread(target=_do, daemon=True).start()
                 self._save_config()
             add_toggle(rec_card, "Privacy mic", privacy_var, _on_privacy)
+
+            remote_var = tk.BooleanVar(value=self._remote_mode)
+            def _on_remote():
+                self._remote_mode = remote_var.get()
+                state = "Mac Mini" if self._remote_mode else "local whisper"
+                print(f"[STT  ] Transcription routed to {state} ({self._remote_url}).")
+                self._save_config()
+            add_toggle(rec_card, "Remote STT (Mac Mini)", remote_var, _on_remote)
 
             bubble_dur_var = tk.StringVar(value=str(self._bubble_duration))
             def _on_bubble_dur(v):
