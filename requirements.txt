@@ -6,3 +6,4 @@ keyboard
 pyperclip
 pystray
 Pillow
+requests

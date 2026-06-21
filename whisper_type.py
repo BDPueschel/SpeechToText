@@ -59,6 +59,10 @@ LLM_MODEL       = "llama3.2:latest"  # Default Ollama model for text cleanup
 LLM_TEMPERATURE = 0.0            # Low = deterministic, high = creative
 OLLAMA_URL      = "http://localhost:11434"
 PRIVACY_MIC     = True            # Only open mic while recording (closes between recordings)
+# --- Remote STT server (Mac Mini) ---
+REMOTE_MODE     = True             # True = POST audio to the Mac server; False = local whisper
+REMOTE_URL      = "http://brians-mac-mini.taildbeee4.ts.net:8400"
+REMOTE_CLEANUP  = "none"           # "none" | "bullets"
 HISTORY_MAX     = 100             # Max entries in history log
 TRANSLATE_LANGS = ["Spanish", "French", "German", "Japanese", "Chinese", "Korean", "Portuguese", "Italian", "Russian", "Arabic"]
 # Models offered in the tray picker (name -> description for tooltip)
@@ -533,8 +537,9 @@ def draw_waveform(size=70, color=None, bar_heights=None, style="Bars", color_rgb
 
             col_h = max(2, int(half_max * max(0.05, bh)))
             x = pad_x + i * (bar_w + gap)
-            # Cap radius so short bars stay rectangular, not circular
-            radius = min(base_radius, col_h)
+            # Cap radius so PIL rounded_rectangle doesn't crash on narrow/short bars
+            # (needs 2*r + 2 <= width and <= height)
+            radius = max(0, min(base_radius, col_h - 1, int((bar_w - 2) / 2)))
             draw.rounded_rectangle(
                 [x, cy - col_h, x + bar_w, cy + col_h],
                 radius=radius,
@@ -1793,6 +1798,26 @@ class WhisperTray:
             os.unlink(tmp_path)
         return text
 
+    def transcribe_remote(self, audio_np):
+        """POST the recorded clip to the Mac STT server; return the text to paste."""
+        import io, wave, requests
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(SAMPLE_RATE)
+            pcm16 = np.clip(audio_np, -1, 1)
+            wf.writeframes((pcm16 * 32767).astype("<i2").tobytes())
+        buf.seek(0)
+        resp = requests.post(
+            f"{REMOTE_URL}/transcribe",
+            files={"file": ("clip.wav", buf, "audio/wav")},
+            data={"cleanup": REMOTE_CLEANUP},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["text"]
+
     def transcribe_streaming(self, audio_np):
         """Transcribe and update the bubble progressively as segments arrive."""
         self._streaming_done = False
@@ -2311,9 +2336,19 @@ class WhisperTray:
             log.debug("_do_transcribe START")
             try:
                 if audio_np is not None:
-                    log.debug("transcribe_streaming START")
-                    post_text = self.transcribe_streaming(audio_np)
-                    log.debug(f"transcribe_streaming DONE: '{post_text[:80] if post_text else ''}'")
+                    if REMOTE_MODE:
+                        try:
+                            log.debug("transcribe_remote START")
+                            post_text = self.transcribe_remote(audio_np)
+                            log.debug(f"transcribe_remote DONE: '{post_text[:80] if post_text else ''}'")
+                        except Exception as e:
+                            print(f"[remote] failed, falling back to local: {e}")
+                            log.warning(f"remote transcribe failed, local fallback: {e}")
+                            post_text = self.transcribe_streaming(audio_np)
+                    else:
+                        log.debug("transcribe_streaming START")
+                        post_text = self.transcribe_streaming(audio_np)
+                        log.debug(f"transcribe_streaming DONE: '{post_text[:80] if post_text else ''}'")
                 else:
                     post_text = ""
             except Exception as e:
