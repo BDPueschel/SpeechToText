@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 100">
+  <defs>
+    <!-- Outer border: brushed metal, lit from above -->
+    <linearGradient id="metalOuter" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#9a9a9a"/>
+      <stop offset="15%" stop-color="#7a7a7a"/>
+      <stop offset="50%" stop-color="#5a5a5a"/>
+      <stop offset="85%" stop-color="#3a3a3a"/>
+      <stop offset="100%" stop-color="#2a2a2a"/>
+    </linearGradient>
+
+    <!-- Inner bevel highlight: bright edge on top, dark on bottom -->
+    <linearGradient id="metalInner" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#b0b0b0"/>
+      <stop offset="20%" stop-color="#888888"/>
+      <stop offset="80%" stop-color="#404040"/>
+      <stop offset="100%" stop-color="#2a2a2a"/>
+    </linearGradient>
+
+    <!-- Subtle top shine -->
+    <linearGradient id="topShine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="white" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="white" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Outer edge darkening -->
+    <linearGradient id="outerEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#606060"/>
+      <stop offset="50%" stop-color="#2a2a2a"/>
+      <stop offset="100%" stop-color="#1a1a1a"/>
+    </linearGradient>
+
+    <!-- Brushed metal noise texture -->
+    <filter id="brushed" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.6 0.02" numOctaves="3" result="noise"/>
+      <feColorMatrix type="saturate" values="0" in="noise" result="gray"/>
+      <feBlend in="SourceGraphic" in2="gray" mode="overlay" result="textured"/>
+      <feComposite in="textured" in2="SourceGraphic" operator="in"/>
+    </filter>
+  </defs>
+
+  <!-- Outer dark edge -->
+  <rect x="1" y="1" width="258" height="98" rx="14" ry="14"
+        fill="url(#outerEdge)" opacity="0.7"/>
+
+  <!-- Main metal border body -->
+  <rect x="3" y="3" width="254" height="94" rx="12" ry="12"
+        fill="url(#metalOuter)" filter="url(#brushed)"/>
+
+  <!-- Inner bevel rim -->
+  <rect x="6" y="6" width="248" height="88" rx="10" ry="10"
+        fill="none" stroke="url(#metalInner)" stroke-width="2"/>
+
+  <!-- Transparent interior (cut-out) -->
+  <rect x="16" y="14" width="228" height="72" rx="6" ry="6"
+        fill="black"/>
+
+  <!-- Top shine across the border -->
+  <rect x="3" y="3" width="254" height="47" rx="12" ry="12"
+        fill="url(#topShine)"/>
+</svg>

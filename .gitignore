@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+whisper_type.json
+whisper_history.json
+session.log

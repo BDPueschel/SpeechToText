@@ -18,24 +18,173 @@ import os
 import wave
 import threading
 import tempfile
+import json
+import ctypes
+import logging
+from datetime import datetime
+import http.client
+import urllib.request
+import urllib.error
+from urllib.parse import urlparse
+import asyncio
 import tkinter as tk
 import numpy as np
+import websockets
+
+# --- Session log ---
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session.log")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(threadName)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler(_log_path, mode="w", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("whisper")
 
 # ---------------------------------------------
 #  CONFIG
 # ---------------------------------------------
 HOTKEY          = "alt+q"            # Hold to record, release to transcribe + paste
-WHISPER_MODEL   = "base.en"       # tiny.en | base.en | small.en | medium.en
+WHISPER_MODEL   = "base.en"       # Default whisper model
+WHISPER_MODEL_OPTIONS = ["tiny.en", "base.en", "small.en", "medium.en", "large-v3"]
 SAMPLE_RATE     = 16000
 APPEND_ENTER    = False           # Auto-submit with Enter after pasting
-BUBBLE_DURATION = 0             # Seconds to show the result bubble (0 = no result bubble)
+BUBBLE_DURATION = 3             # Seconds to show the result bubble (0 = no result bubble)
 SMOOTHING       = 0.45            # FFT bar smoothing (0 = no smoothing, 1 = frozen)
+LLM_CLEANUP     = True            # Post-process transcription with a local LLM
+LLM_MODEL       = "llama3.2:latest"  # Default Ollama model for text cleanup
+LLM_TEMPERATURE = 0.0            # Low = deterministic, high = creative
+OLLAMA_URL      = "http://localhost:11434"
 PRIVACY_MIC     = True            # Only open mic while recording (closes between recordings)
+# --- Remote STT server (Mac Mini) ---
+REMOTE_MODE     = True             # True = POST audio to the Mac server; False = local whisper
+REMOTE_URL      = "http://brians-mac-mini.taildbeee4.ts.net:8400"
+REMOTE_CLEANUP  = "none"           # "none" | "bullets"
+HISTORY_MAX     = 100             # Max entries in history log
+TRANSLATE_LANGS = ["Spanish", "French", "German", "Japanese", "Chinese", "Korean", "Portuguese", "Italian", "Russian", "Arabic"]
+# Models offered in the tray picker (name -> description for tooltip)
+LLM_MODEL_OPTIONS = [
+    "llama3.2:latest",
+    "llama3.2:1b",
+    "gemma3:4b",
+    "gemma3:12b",
+    "phi4:latest",
+    "qwen2.5-coder:14b",
+    "deepseek-r1:8b",
+    "deepseek-r1:14b",
+    "granite3.2:latest",
+    "dolphin-mistral:latest",
+    "hermes3:latest",
+    "mannix/llama3.1-8b-abliterated:latest",
+    "wizardlm-uncensored:latest",
+]
+
+# LLM prompt personalities
+LLM_PROMPTS = {
+    "Minimal": (
+        "TASK: Fix punctuation and capitalization in this speech transcription.\n"
+        "RULES: Do not rephrase, summarize, or remove any words. Do not add any "
+        "commentary, explanation, or prefix. Output ONLY the corrected text and "
+        "absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Natural": (
+        "TASK: Clean up this speech transcription into natural written text.\n"
+        "RULES: Fix capitalization and punctuation. Remove filler words (um, uh, like, "
+        "you know) and false starts. Preserve the speaker's intended meaning. Do not add "
+        "any commentary, explanation, or prefix. Output ONLY the corrected text and "
+        "absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Professional": (
+        "TASK: Rewrite this speech transcription as clean, professional text.\n"
+        "RULES: Fix punctuation, capitalization, and grammar. Remove filler words and "
+        "verbal tics. Lightly restructure run-on sentences for clarity. Keep the original "
+        "meaning and tone. Do not add any commentary, explanation, or prefix. Output ONLY "
+        "the corrected text and absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Bullet Points": (
+        "TASK: Convert this speech transcription into a bullet-point list.\n"
+        "RULES: Extract each distinct thought or idea as its own bullet point. "
+        "Each bullet should be a clear, complete sentence that makes sense on its own. "
+        "Lightly rephrase for readability if needed but preserve the original meaning. "
+        "Fix punctuation and capitalization. Use a dash (-) for each bullet. Do not add "
+        "any commentary, explanation, or prefix. Output ONLY the bullet list and "
+        "absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Concise": (
+        "TASK: Condense this speech transcription to its shortest form.\n"
+        "RULES: Remove all filler, redundancy, and unnecessary words. Keep the full "
+        "meaning intact. Fix punctuation and capitalization. Do not add any commentary, "
+        "explanation, or prefix. Output ONLY the condensed text and absolutely nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Story": (
+        "TASK: Transform this speech into a short, whimsical micro-story.\n"
+        "RULES: Take the speaker's words and weave them into a fun, imaginative narrative "
+        "with a beginning, middle, and end. Be creative, playful, and dramatic. Add vivid "
+        "details and flair. Keep it to 2-4 sentences maximum — punchy and tight. "
+        "Do not add any commentary or prefix. Output ONLY the story and absolutely "
+        "nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+    "Emoji": (
+        "TASK: Convert this speech transcription into a sequence of emojis.\n"
+        "RULES: Replace every word, phrase, and idea with the most fitting emoji(s). "
+        "Use ONLY emojis — no letters, no words, no punctuation, no spaces between emojis. "
+        "Capture the full meaning and flow of the original text using emojis alone. "
+        "Be expressive and use a variety of emojis. Output ONLY emojis and absolutely "
+        "nothing else.\n"
+        "INPUT: {text}\n"
+        "OUTPUT:"
+    ),
+}
+
+# Special prompts (not in the style picker, triggered by separate toggles)
+TONE_PROMPT = (
+    "TASK: Detect the tone of this text and return a single emoji that best represents it.\n"
+    "RULES: Choose from: \u2753 (question), \u2757 (urgent), \U0001f4a1 (idea), "
+    "\U0001f600 (happy/casual), \U0001f614 (frustrated), \U0001f4cb (instructions), "
+    "\U0001f914 (thoughtful), \U0001f525 (excited). Output ONLY the single emoji "
+    "and absolutely nothing else.\n"
+    "INPUT: {text}\n"
+    "OUTPUT:"
+)
+
+TRANSLATE_PROMPT = (
+    "TASK: Translate this text into {language}.\n"
+    "RULES: Produce a natural, accurate translation. Do not add any commentary, "
+    "explanation, or prefix. Output ONLY the translated text and absolutely nothing else.\n"
+    "INPUT: {text}\n"
+    "OUTPUT:"
+)
+
+LLM_DEFAULT_PROMPT = "Minimal"
 # ---------------------------------------------
 
 NUM_BARS = 10
 FFT_CHUNK = 2048  # samples for FFT (~128ms at 16kHz)
+
+# --- Color themes ---
+THEMES = {
+    "Synthwave": (255, 46, 150),    # hot pink / magenta
+    "Windows Theme": None,           # filled dynamically from registry
+}
+THEME_DEFAULT = "Synthwave"
 CHIME_RATE = 44100  # sample rate for chime playback
+DICTATION_HOTKEY = "alt+d"  # Default dictation toggle key
+WS_PORT = 5001               # WebSocket bridge port for dashboard integration
 
 
 def _generate_chime(freq, duration=0.12, volume=0.3, fade=0.03):
@@ -67,7 +216,7 @@ HOTKEY_OPTIONS = [
     "ctrl+`", "ctrl+\\",
     "ctrl+alt+r", "ctrl+alt+s", "ctrl+alt+w",
     # Alt combos
-    "alt+`", "alt+\\", "alt+q"
+    "alt+`", "alt+\\", "alt+q", "alt+d"
 ]
 
 
@@ -99,6 +248,39 @@ def detect_cuda():
         return False
 
 
+def auto_punctuate(text):
+    """Lightweight punctuation/capitalization without LLM."""
+    import re
+    if not text:
+        return text
+    text = text[0].upper() + text[1:]
+    text = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), text)
+    text = re.sub(r'\bi\b', 'I', text)
+    if text and text[-1] not in '.!?':
+        text += '.'
+    return text
+
+
+def _breathing_bars(phase, num_bars=NUM_BARS):
+    """Generate sine-wave bar heights for idle breathing animation.
+
+    A visible sine wave travels across the bars, modulated by a slow
+    breath envelope so it swells and recedes.
+    """
+    import math
+    # Slow breath envelope scales the wave: 0.4 … 1.0
+    breath = 0.4 + 0.6 * (0.5 + 0.5 * math.cos(phase * 0.4))
+    # Sine wave across bars — large enough to see the wave shape
+    base = 0.12
+    wave_amp = 0.55
+    spacing = 0.7
+    return [
+        max(0.06, base + wave_amp * breath *
+            (0.5 + 0.5 * math.sin(phase * 1.1 + i * spacing)))
+        for i in range(num_bars)
+    ]
+
+
 def make_icon_image(color):
     """Create a simple colored circle icon for the system tray."""
     from PIL import Image, ImageDraw
@@ -109,36 +291,343 @@ def make_icon_image(color):
     return img
 
 
-def draw_waveform(size=96, color="#F44336", bar_heights=None):
-    """Draw waveform equalizer bars and return a Pillow RGBA Image."""
+def make_tray_fft_icon(bar_heights, accent_rgb=None, dim=False):
+    """Create a 64x64 tray icon with mini FFT bars."""
     from PIL import Image, ImageDraw
-
-    if bar_heights is None:
-        bar_heights = [0.3, 0.6, 0.9, 0.6, 0.3]
-
-    num_bars = len(bar_heights)
+    import colorsys
+    size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+    # Dark circular background
+    draw.ellipse([2, 2, size - 2, size - 2], fill=(20, 22, 30, 220))
 
-    padding = size * 0.15
-    usable_w = size - 2 * padding
-    gap_ratio = 0.4
-    bar_w = usable_w / (num_bars + (num_bars - 1) * gap_ratio)
-    gap = bar_w * gap_ratio
-    max_h = size * 0.70
-    cy = size / 2
-    radius = bar_w / 2
+    ar, ag, ab = accent_rgb or getattr(Bubble, '_theme_rgb', _ACCENT_RGB)
+    ah, as_, av = colorsys.rgb_to_hsv(ar / 255, ag / 255, ab / 255)
+    if dim:
+        av *= 0.5
+        as_ *= 0.7
 
-    for i, h in enumerate(bar_heights):
-        x = padding + i * (bar_w + gap)
-        bar_h = max(bar_w, max_h * h)
-        top = cy - bar_h / 2
-        bot = cy + bar_h / 2
-        draw.rounded_rectangle(
-            [x, top, x + bar_w, bot],
-            radius=radius,
-            fill=color,
-        )
+    num = len(bar_heights)
+    pad = 12
+    usable = size - 2 * pad
+    bar_w = max(2, usable // (num * 2 - 1) + 1)
+    gap = max(1, bar_w // 2)
+    total_w = num * bar_w + (num - 1) * gap
+    x_start = (size - total_w) // 2
+    cy = size // 2
+    max_h = (size - 2 * pad) // 2
+
+    for i, bh in enumerate(bar_heights):
+        t = (i + 0.5) / num
+        hue = (ah + (t - 0.5) * 0.1) % 1.0
+        rv, gv, bv = colorsys.hsv_to_rgb(hue, min(1.0, as_), min(1.0, av))
+        r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+        h = max(2, int(max_h * max(0.08, bh)))
+        x = x_start + i * (bar_w + gap)
+        draw.rounded_rectangle([x, cy - h, x + bar_w, cy + h],
+                               radius=max(1, bar_w // 3), fill=(r, g, b, 220 if not dim else 140))
+    return img
+
+
+def _get_windows_accent_color():
+    """Read the Windows theme accent color from the registry. Returns (r, g, b)."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM")
+        val, _ = winreg.QueryValueEx(key, "AccentColor")
+        winreg.CloseKey(key)
+        # AccentColor is stored as ABGR DWORD
+        r = val & 0xFF
+        g = (val >> 8) & 0xFF
+        b = (val >> 16) & 0xFF
+        return (r, g, b)
+    except Exception:
+        return (100, 140, 230)  # fallback soft blue
+
+
+# Cache the accent color at import time (avoids registry reads every frame)
+_ACCENT_RGB = _get_windows_accent_color()
+
+# --- Metal frame asset ---
+_metal_frame_cache = {}
+
+def _load_metal_frame(target_w, target_h):
+    """Procedurally render a brushed-metal frame at exact target size.
+
+    Inspired by Assets/metal_frame.svg — top-lit metallic border with bevel.
+    Returns (frame_image, interior_bbox) where interior_bbox is
+    (x_start, y_start, x_end, y_end) of the transparent interior.
+    """
+    cache_key = (target_w, target_h)
+    if cache_key in _metal_frame_cache:
+        return _metal_frame_cache[cache_key]
+
+    from PIL import Image, ImageDraw, ImageFilter
+
+    # Render at 2x for supersampled anti-aliasing, then downsample
+    S = 2
+    W, H = target_w * S, target_h * S
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # Frame geometry (in 2x space)
+    border = max(6, int(H * 0.11))
+    radius = max(6, int(H * 0.14))
+    inner_radius = max(3, radius - 3)
+
+    # --- Outer dark edge ---
+    outer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(outer).rounded_rectangle(
+        [0, 0, W - 1, H - 1], radius=radius, fill=(35, 35, 38, 200))
+    img = Image.alpha_composite(img, outer)
+
+    # --- Main metal body with vertical gradient (top-lit) ---
+    metal = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    metal_d = ImageDraw.Draw(metal)
+    metal_d.rounded_rectangle([2, 2, W - 3, H - 3], radius=radius,
+                              fill=(255, 255, 255, 255))
+    # Build shape mask for the metal body
+    shape_alpha = np.array(metal)[:, :, 3]
+    # Apply vertical gradient: bright top -> dark bottom
+    metal_arr = np.array(metal)
+    for y in range(H):
+        t = y / max(H - 1, 1)
+        gray = int(155 - 105 * t)
+        mask = metal_arr[y, :, 3] > 0
+        metal_arr[y, mask, 0] = gray
+        metal_arr[y, mask, 1] = gray
+        metal_arr[y, mask, 2] = gray + 2
+
+    # Brushed-metal noise (masked to frame shape only)
+    noise = np.random.default_rng(42).integers(0, 25, (H, W), dtype=np.uint8)
+    metal_arr[:, :, 0] = np.clip(metal_arr[:, :, 0].astype(np.int16) + noise - 12, 0, 255).astype(np.uint8)
+    metal_arr[:, :, 1] = np.clip(metal_arr[:, :, 1].astype(np.int16) + noise - 12, 0, 255).astype(np.uint8)
+    metal_arr[:, :, 2] = np.clip(metal_arr[:, :, 2].astype(np.int16) + noise - 12, 0, 255).astype(np.uint8)
+    # Zero out noise outside the shape
+    metal_arr[shape_alpha == 0] = (0, 0, 0, 0)
+    metal = Image.fromarray(metal_arr, "RGBA")
+
+    img = Image.alpha_composite(img, metal)
+
+    # --- Cut out interior (transparent center) ---
+    ix0 = border + 2
+    iy0 = border + 2
+    ix1 = W - border - 3
+    iy1 = H - border - 3
+    cutout_arr = np.array(img)
+    cut_mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(cut_mask).rounded_rectangle(
+        [ix0, iy0, ix1, iy1], radius=inner_radius, fill=255)
+    cutout_arr[np.array(cut_mask) > 128] = (0, 0, 0, 0)
+    img = Image.fromarray(cutout_arr, "RGBA")
+
+    # --- Inner bevel: bright top edge, dark bottom edge ---
+    bevel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    bevel_d = ImageDraw.Draw(bevel)
+    bevel_d.rounded_rectangle([ix0 - 1, iy0 - 1, ix1 + 1, iy0 + 2],
+                              radius=max(2, inner_radius - 1),
+                              fill=(180, 180, 185, 120))
+    bevel_d.rounded_rectangle([ix0 - 1, iy1 - 2, ix1 + 1, iy1 + 1],
+                              radius=max(2, inner_radius - 1),
+                              fill=(15, 15, 18, 140))
+    bevel = bevel.filter(ImageFilter.GaussianBlur(radius=2))
+    img = Image.alpha_composite(img, bevel)
+
+    # --- Top shine across the frame ---
+    shine = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(shine).rounded_rectangle(
+        [3, 3, W - 4, H // 3], radius=radius, fill=(255, 255, 255, 25))
+    shine = shine.filter(ImageFilter.GaussianBlur(radius=3))
+    img = Image.alpha_composite(img, shine)
+
+    # --- Downsample to target size ---
+    img = img.resize((target_w, target_h), Image.LANCZOS)
+
+    # Compute interior bbox in target coordinates
+    ix0_t = round(ix0 / S)
+    iy0_t = round(iy0 / S)
+    ix1_t = round(ix1 / S)
+    iy1_t = round(iy1 / S)
+
+    result = (img, (ix0_t, iy0_t, ix1_t, iy1_t))
+    _metal_frame_cache[cache_key] = result
+    return result
+
+
+def draw_waveform(size=70, color=None, bar_heights=None, style="Bars", color_rgb=None,
+                  cells_per_bar=4):
+    """Draw FFT inside a metal frame, tinted with theme color.
+
+    color_rgb: (r, g, b) tuple for bar colors. Falls back to _ACCENT_RGB.
+    style: "Bars" for discrete rounded bars, "Pixel" for LED matrix, "Wave" for smooth waveform.
+    cells_per_bar: number of LED cells per half-bar in Pixel mode.
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+    import colorsys
+
+    W, H = int(size * 2.6), size  # wide capsule aspect ratio
+    if bar_heights is None:
+        bar_heights = [0.15] * NUM_BARS
+
+    ar, ag, ab = color_rgb or _ACCENT_RGB
+    # Derive accent hue for color variations
+    ah, as_, av = colorsys.rgb_to_hsv(ar / 255, ag / 255, ab / 255)
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # --- FFT content (centered within the metal frame interior) ---
+    frame_img, (ix0, iy0, ix1, iy1) = _load_metal_frame(W, H)
+    inset = 2  # small extra inset from frame edges
+    pad_x = ix0 + inset
+    wave_w = (ix1 - ix0) - 2 * inset
+    cy = (iy0 + iy1) // 2
+    half_max = int((iy1 - iy0) * 0.40)
+    num_bars = len(bar_heights)
+
+    if style == "Pixel":
+        # --- LED matrix: separate pipeline, no rounding, no glow ---
+        gap_ratio = 0.45
+        bar_w = wave_w / (num_bars + (num_bars - 1) * gap_ratio)
+        gap = bar_w * gap_ratio
+        # Cell sizing: 2px gap drawn as dark lines for visibility at any scale
+        cell_gap = 2
+        cell_h = max(2, (half_max - (cells_per_bar - 1) * cell_gap) // cells_per_bar)
+        cell_step = cell_h + cell_gap
+
+        for i, bh in enumerate(bar_heights):
+            t = (i + 0.5) / num_bars
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            edge_dim = 1.0 - 0.15 * abs(t - 0.5) * 2
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.9), min(1.0, av * edge_dim))
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+            # Dimmed color for "unlit" cells
+            rd, gd, bd = int(r * 0.15), int(g * 0.15), int(b * 0.15)
+
+            x0 = int(pad_x + i * (bar_w + gap))
+            x1 = int(x0 + bar_w)
+            lit = max(1, round(cells_per_bar * max(0.05, bh)))
+            # Draw all cells: lit ones bright, unlit ones dim
+            for c in range(cells_per_bar):
+                is_lit = c < lit
+                cr, cg, cb = (r, g, b) if is_lit else (rd, gd, bd)
+                y_off = c * cell_step
+                # Top half (above center)
+                draw.rectangle([x0, cy - y_off - cell_h, x1, cy - y_off],
+                               fill=(cr, cg, cb, 255))
+                # Bottom half (below center)
+                draw.rectangle([x0, cy + y_off, x1, cy + y_off + cell_h],
+                               fill=(cr, cg, cb, 255))
+
+    elif style == "Bars":
+        # --- Smooth rounded bars with glow ---
+        gap_ratio = 0.85
+        bar_w = wave_w / (num_bars + (num_bars - 1) * gap_ratio)
+        gap = bar_w * gap_ratio
+        # Base radius from bar width (pill shape)
+        base_radius = max(2, int(bar_w / 3))
+
+        for i, bh in enumerate(bar_heights):
+            t = (i + 0.5) / num_bars
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            edge_dim = 1.0 - 0.15 * abs(t - 0.5) * 2
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.9), min(1.0, av * edge_dim))
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+
+            col_h = max(2, int(half_max * max(0.05, bh)))
+            x = pad_x + i * (bar_w + gap)
+            # Cap radius so PIL rounded_rectangle doesn't crash on narrow/short bars
+            # (needs 2*r + 2 <= width and <= height)
+            radius = max(0, min(base_radius, col_h - 1, int((bar_w - 2) / 2)))
+            draw.rounded_rectangle(
+                [x, cy - col_h, x + bar_w, cy + col_h],
+                radius=radius,
+                fill=(r, g, b, 230),
+            )
+
+        # Bar glow (scaled to pill size)
+        glow_r = max(1, min(3, half_max // 6))
+        dot_r = max(1, min(3, int(bar_w / 3)))
+        bar_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        bg_draw = ImageDraw.Draw(bar_glow)
+        for i, bh in enumerate(bar_heights):
+            t = (i + 0.5) / num_bars
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.7), 1.0)
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+            col_h = max(3, int(half_max * max(0.05, bh)))
+            x = pad_x + i * (bar_w + gap) + bar_w / 2
+            bg_draw.ellipse([x - dot_r, cy - col_h - dot_r, x + dot_r, cy - col_h + dot_r], fill=(r, g, b, 50))
+            bg_draw.ellipse([x - dot_r, cy + col_h - dot_r, x + dot_r, cy + col_h + dot_r], fill=(r, g, b, 50))
+        bar_glow = bar_glow.filter(ImageFilter.GaussianBlur(radius=glow_r))
+        img = Image.alpha_composite(img, bar_glow)
+
+    else:
+        # Smooth wave: interpolate bar heights to per-pixel curve
+        heights_px = []
+        for px in range(wave_w):
+            t = px / max(wave_w - 1, 1) * (num_bars - 1)
+            idx = int(t)
+            frac = t - idx
+            if idx >= num_bars - 1:
+                h = bar_heights[-1]
+            else:
+                h = bar_heights[idx] * (1 - frac) + bar_heights[idx + 1] * frac
+            heights_px.append(max(0.05, h))
+
+        for px in range(wave_w):
+            t = px / max(wave_w - 1, 1)
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            edge_dim = 1.0 - 0.15 * abs(t - 0.5) * 2
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.9), min(1.0, av * edge_dim))
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+
+            col_h = int(half_max * heights_px[px])
+            x = pad_x + px
+            for y in range(cy - col_h, cy + col_h + 1):
+                dist = abs(y - cy) / max(col_h, 1)
+                alpha = int(160 + 95 * dist)
+                img.putpixel((x, y), (r, g, b, min(255, alpha)))
+
+        # Wave glow on peaks
+        wave_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        wg_draw = ImageDraw.Draw(wave_glow)
+        for px in range(0, wave_w, 3):
+            t = px / max(wave_w - 1, 1)
+            hue_shift = (t - 0.5) * 0.12
+            h = (ah + hue_shift) % 1.0
+            rv, gv, bv = colorsys.hsv_to_rgb(h, min(1.0, as_ * 0.7), 1.0)
+            r, g, b = int(rv * 255), int(gv * 255), int(bv * 255)
+            col_h = int(half_max * heights_px[px])
+            x = pad_x + px
+            wg_draw.ellipse([x - 2, cy - col_h - 2, x + 2, cy - col_h + 2], fill=(r, g, b, 80))
+            wg_draw.ellipse([x - 2, cy + col_h - 2, x + 2, cy + col_h + 2], fill=(r, g, b, 80))
+        wave_glow = wave_glow.filter(ImageFilter.GaussianBlur(radius=3))
+        img = Image.alpha_composite(img, wave_glow)
+
+    # --- Composite metal frame on top of FFT bars ---
+    img = Image.alpha_composite(img, frame_img)
+
+    # --- Flatten alpha for Windows color-key transparency ---
+    # Tkinter's -transparentcolor is binary (no partial transparency),
+    # so semi-transparent glow pixels would show as dark fringe on light
+    # backgrounds. Threshold: low-alpha pixels become the key color,
+    # everything else composites onto it as fully opaque.
+    arr = np.array(img)
+    alpha = arr[:, :, 3]
+    key = (1, 1, 1)  # matches Bubble.TRANSPARENT "#010101"
+    # Pixels below threshold → fully transparent key color
+    mask = alpha < 25
+    arr[mask] = (*key, 255)
+    # Remaining pixels: composite onto the key color so they're fully opaque
+    a = alpha[~mask].astype(np.float32) / 255.0
+    for c in range(3):
+        arr[~mask, c] = (arr[~mask, c] * a + key[c] * (1 - a) + 0.5).astype(np.uint8)
+    arr[:, :, 3] = 255  # fully opaque everywhere
+    img = Image.fromarray(arr, "RGBA")
 
     return img
 
@@ -149,17 +638,34 @@ def draw_waveform(size=96, color="#F44336", bar_heights=None):
 class Bubble:
     """A small popup at bottom-center of the screen."""
 
+    _accent_hex = "#{:02x}{:02x}{:02x}".format(*_ACCENT_RGB)
+    _theme_rgb = _ACCENT_RGB  # active theme color as (r, g, b)
     COLORS = {
-        "recording":    {"bg": "#F44336", "fg": "#FFFFFF"},
-        "transcribing": {"bg": "#FFC107", "fg": "#000000"},
-        "result":       {"bg": "#4CAF50", "fg": "#FFFFFF"},
+        "recording":    {"bg": _accent_hex, "fg": "#FFFFFF"},
+        "transcribing": {"bg": _accent_hex, "fg": "#FFFFFF"},
+        "result":       {"bg": _accent_hex, "fg": "#FFFFFF"},
     }
+
+    @classmethod
+    def set_theme(cls, theme_name):
+        """Update the active color theme."""
+        rgb = THEMES.get(theme_name)
+        if rgb is None:
+            # "Windows Theme" — re-read live from registry
+            rgb = _get_windows_accent_color()
+        cls._theme_rgb = rgb
+        cls._accent_hex = "#{:02x}{:02x}{:02x}".format(*rgb)
+        cls.COLORS = {
+            "recording":    {"bg": cls._accent_hex, "fg": "#FFFFFF"},
+            "transcribing": {"bg": cls._accent_hex, "fg": "#FFFFFF"},
+            "result":       {"bg": cls._accent_hex, "fg": "#FFFFFF"},
+        }
 
     FADE_STEPS  = 12
     FADE_MS     = 16
     MAX_ALPHA   = 0.92
     TRANSPARENT = "#010101"
-    MIC_SIZE    = 120
+    MIC_SIZE    = 41
 
     def __init__(self, fft_callback=None):
         self._root = None
@@ -173,6 +679,7 @@ class Bubble:
         self._fade_job = None
         self._alpha = 0.0
         self._current_style = None
+        self._on_select = None  # callback(text) when user clicks a debug result
         # Smoothed bar heights for interpolation
         self._smooth_bars = [0.15] * NUM_BARS
 
@@ -182,7 +689,10 @@ class Bubble:
 
     def _build_waveform_photo(self, color_hex, bar_heights=None):
         from PIL import ImageTk
-        pil_img = draw_waveform(size=self.MIC_SIZE, color=color_hex, bar_heights=bar_heights)
+        pil_img = draw_waveform(size=self.MIC_SIZE, color=color_hex, bar_heights=bar_heights,
+                                style=getattr(self, "waveform_style", "Bars"),
+                                color_rgb=self._theme_rgb,
+                                cells_per_bar=getattr(self, "cells_per_bar", 4))
         photo = ImageTk.PhotoImage(pil_img)
         return photo
 
@@ -212,7 +722,85 @@ class Bubble:
             wraplength=500,
         )
 
-        self._mic_images["result"] = self._build_waveform_photo("#4CAF50")
+        self._timer_label = tk.Label(
+            self._frame,
+            text="0:00",
+            font=("Consolas", 12),
+            bg=self.TRANSPARENT,
+            fg="#FFFFFF",
+            padx=4,
+            pady=0,
+        )
+
+        # Live transcription preview panel (to the right of the pill)
+        _prev_bg = "#0c0d10"
+        self._preview_frame = tk.Frame(self._frame, bg=_prev_bg)
+        self._preview_text = tk.Text(
+            self._preview_frame,
+            font=("Segoe UI", 12),
+            bg=_prev_bg,
+            fg="#CCCCCC",
+            padx=14,
+            pady=8,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            state="disabled",
+            width=44,
+            height=8,
+            cursor="arrow",
+        )
+        self._preview_text.tag_configure("scratched", foreground="#e05252", overstrike=True)
+        self._preview_text.tag_configure("kept", foreground="#d4d6de")
+        self._preview_text.pack(fill="both", expand=True)
+        self._scratch_anim_job = None  # after() ID for scratch animation
+        self._preview_font = "Segoe UI"  # track current font for scratch animation
+
+        # Side-by-side comparison labels for LLM cleanup
+        self._compare_frame = tk.Frame(self._frame, bg=self.TRANSPARENT)
+        self._orig_label = tk.Label(
+            self._compare_frame,
+            text="",
+            font=("Segoe UI", 14),
+            padx=12,
+            pady=8,
+            wraplength=350,
+            justify="left",
+        )
+        self._arrow_label = tk.Label(
+            self._compare_frame,
+            text="\u2192",
+            font=("Segoe UI", 20, "bold"),
+            padx=8,
+            pady=8,
+            bg=self.TRANSPARENT,
+            fg="#FFFFFF",
+        )
+        self._clean_label = tk.Label(
+            self._compare_frame,
+            text="",
+            font=("Segoe UI", 16, "bold"),
+            padx=12,
+            pady=8,
+            wraplength=350,
+            justify="left",
+        )
+
+        # Debug mode: 3-column display for all prompt personalities
+        self._debug_frame = tk.Frame(self._frame, bg=self.TRANSPARENT)
+        self._debug_labels = {}
+        self._debug_colors = {
+            "Minimal": "#42A5F5",        # blue
+            "Natural": "#66BB6A",        # green
+            "Professional": "#AB47BC",   # purple
+            "Bullet Points": "#FFA726",  # orange
+            "Concise": "#26C6DA",        # cyan
+            "Story": "#FF7043",          # coral
+            "Emoji": "#FFEE58",          # yellow
+        }
+
+        self._mic_images["result"] = self._build_waveform_photo(self._accent_hex)
 
         self._screen_w = self._root.winfo_screenwidth()
         self._screen_h = self._root.winfo_screenheight()
@@ -244,8 +832,11 @@ class Bubble:
         def _tick():
             if self._fft_callback:
                 raw = self._fft_callback()
+                # Resize smooth bars if bar count changed
+                if len(self._smooth_bars) != len(raw):
+                    self._smooth_bars = [0.15] * len(raw)
                 # Exponential smoothing for fluid bar motion
-                for i in range(NUM_BARS):
+                for i in range(len(raw)):
                     self._smooth_bars[i] += (raw[i] - self._smooth_bars[i]) * (1.0 - SMOOTHING)
                 photo = self._build_waveform_photo(color_hex, bar_heights=self._smooth_bars)
                 self._mic_label.config(image=photo)
@@ -277,15 +868,121 @@ class Bubble:
 
         self._fade_job = self._root.after(self.FADE_MS, _tick)
 
-    def show(self, text, style="recording", duration=None):
+    def show(self, text, style="recording", duration=None, original=None, debug_results=None, low_confidence=False):
         def _update():
             self._cancel_animations()
+            self.stop_idle_breathing()
             self._current_style = style
 
             self._mic_label.pack_forget()
             self._label.pack_forget()
+            self._timer_label.pack_forget()
+            self._preview_frame.pack_forget()
+            self._compare_frame.pack_forget()
+            self._debug_frame.pack_forget()
 
-            if style == "result":
+            # For recording/transcribing styles, always pack both mic + timer
+            # to keep layout stable (timer text is cleared when not recording)
+            _is_waveform_style = style in ("recording", "transcribing")
+
+            if style == "debug" and debug_results is not None:
+                # Show original + all 3 prompt results as clickable columns
+                self._root.config(bg=self.TRANSPARENT)
+                self._frame.config(bg=self.TRANSPARENT)
+                self._root.attributes("-transparentcolor", self.TRANSPARENT)
+
+                # Clear old debug labels
+                for w in self._debug_frame.winfo_children():
+                    w.destroy()
+
+                # Original text header
+                orig_header = tk.Label(
+                    self._debug_frame, text="Original",
+                    font=("Segoe UI", 10, "bold"), bg="#222222", fg="#888888",
+                    padx=8, pady=2,
+                )
+                orig_header.grid(row=0, column=0, columnspan=len(debug_results), sticky="w", padx=4, pady=(4, 0))
+                orig_text = tk.Label(
+                    self._debug_frame, text=original or text,
+                    font=("Segoe UI", 11), bg="#222222", fg="#AAAAAA",
+                    padx=8, pady=4, wraplength=900, justify="left",
+                )
+                orig_text.grid(row=1, column=0, columnspan=len(debug_results), sticky="we", padx=4, pady=(0, 8))
+
+                hint = tk.Label(
+                    self._debug_frame, text="\u2190 \u2192 navigate  |  Enter = paste + send  |  Shift+Enter or Shift+click = paste only",
+                    font=("Segoe UI", 9), bg="#222222", fg="#666666",
+                    padx=8, pady=0,
+                )
+                hint.grid(row=4, column=0, columnspan=len(debug_results), pady=(4, 2))
+
+                # Build columns and track them for keyboard navigation
+                columns = []  # list of (col_frame, header, body, result_text)
+                for col, (name, result_text) in enumerate(debug_results.items()):
+                    color = self._debug_colors.get(name, "#FFFFFF")
+                    col_frame = tk.Frame(self._debug_frame, bg="#333333", cursor="hand2")
+                    col_frame.grid(row=3, column=col, sticky="nswe", padx=4, pady=(0, 4))
+
+                    header = tk.Label(
+                        col_frame, text=name,
+                        font=("Segoe UI", 9, "bold"), bg="#333333", fg=color,
+                        padx=6, pady=2, cursor="hand2",
+                    )
+                    header.pack(anchor="w")
+                    body = tk.Label(
+                        col_frame, text=result_text,
+                        font=("Segoe UI", 10), bg="#333333", fg=color,
+                        padx=6, pady=4, wraplength=170, justify="left", anchor="nw",
+                        cursor="hand2",
+                    )
+                    body.pack(anchor="w", fill="x")
+                    columns.append((col_frame, header, body, result_text))
+
+                    # Click handler
+                    def _on_click(e, txt=result_text):
+                        shift = bool(e.state & 0x1)  # Shift modifier flag
+                        if self._on_select:
+                            self._on_select(txt, shift_held=shift)
+                        self._do_hide()
+
+                    # Hover effects
+                    def _on_enter(e, f=col_frame, h=header, b=body):
+                        f.config(bg="#444444")
+                        h.config(bg="#444444")
+                        b.config(bg="#444444")
+
+                    def _on_leave(e, f=col_frame, h=header, b=body):
+                        f.config(bg="#333333")
+                        h.config(bg="#333333")
+                        b.config(bg="#333333")
+
+                    for widget in (col_frame, header, body):
+                        widget.bind("<Button-1>", _on_click)
+                        widget.bind("<Enter>", _on_enter)
+                        widget.bind("<Leave>", _on_leave)
+
+                # Track columns for external keyboard navigation
+                self._debug_columns = columns
+                self._debug_selected = -1
+
+                self._debug_frame.pack(pady=4)
+
+            elif style == "compare" and original is not None:
+                # Side-by-side: original (left) -> cleaned (right)
+                self._root.config(bg=self.TRANSPARENT)
+                self._frame.config(bg=self.TRANSPARENT)
+                self._root.attributes("-transparentcolor", self.TRANSPARENT)
+
+                self._orig_label.config(text=original, bg="#333333", fg="#AAAAAA")
+                self._arrow_label.config(bg=self.TRANSPARENT, fg="#FFFFFF")
+                self._clean_label.config(text=text, bg="#333333", fg=self._accent_hex)
+
+                self._orig_label.pack(side="left", padx=(8, 0), pady=4)
+                self._arrow_label.pack(side="left", padx=4, pady=4)
+                self._clean_label.pack(side="left", padx=(0, 8), pady=4)
+                self._compare_frame.pack(pady=4)
+
+            elif style == "result":
                 self._root.config(bg=self.TRANSPARENT)
                 self._frame.config(bg=self.TRANSPARENT)
                 self._root.attributes("-transparentcolor", self.TRANSPARENT)
@@ -293,7 +990,8 @@ class Bubble:
                 self._mic_label.config(image=self._mic_images["result"], bg=self.TRANSPARENT)
                 self._mic_label.pack(side="left", padx=(8, 0), pady=4)
 
-                self._label.config(text=text, bg=self.TRANSPARENT, fg="#FFFFFF")
+                text_fg = "#FFB74D" if low_confidence else "#FFFFFF"
+                self._label.config(text=text, bg=self.TRANSPARENT, fg=text_fg)
                 self._label.pack(side="left", padx=(4, 16), pady=4)
             else:
                 self._root.config(bg=self.TRANSPARENT)
@@ -303,6 +1001,12 @@ class Bubble:
                 color = self.COLORS[style]["bg"]
                 self._mic_label.config(bg=self.TRANSPARENT)
                 self._mic_label.pack()
+                # Always pack timer to prevent layout shift; hide text when not recording
+                if style == "recording":
+                    self._timer_label.config(text="0:00", fg=color, bg=self.TRANSPARENT)
+                else:
+                    self._timer_label.config(text=" ", fg=self.TRANSPARENT, bg=self.TRANSPARENT)
+                self._timer_label.pack()
                 self._start_live_fft(color)
 
             self._position_bottom_center()
@@ -311,18 +1015,264 @@ class Bubble:
 
             self._fade_to(self.MAX_ALPHA)
 
-            if duration:
+            if duration and style != "debug":
                 self._hide_timer = self._root.after(
                     int(duration * 1000), self._do_hide
                 )
 
         self._root.after(0, _update)
 
+    def debug_navigate(self, direction):
+        """Move highlight left (-1) or right (+1) in Multi-Model Preview."""
+        def _update():
+            cols = getattr(self, "_debug_columns", [])
+            if not cols:
+                return
+            sel = getattr(self, "_debug_selected", -1)
+            # Un-highlight previous
+            if 0 <= sel < len(cols):
+                pf, ph, pb, _ = cols[sel]
+                pf.config(bg="#333333")
+                ph.config(bg="#333333")
+                pb.config(bg="#333333")
+            # Compute new index
+            if direction > 0:
+                new = min(sel + 1, len(cols) - 1) if sel >= 0 else 0
+            else:
+                new = max(sel - 1, 0)
+            self._debug_selected = new
+            f, h, b, _ = cols[new]
+            f.config(bg="#444444")
+            h.config(bg="#444444")
+            b.config(bg="#444444")
+        self._root.after(0, _update)
+
+    def debug_confirm(self, shift_held=False):
+        """Confirm the currently highlighted Multi-Model Preview selection."""
+        def _update():
+            cols = getattr(self, "_debug_columns", [])
+            sel = getattr(self, "_debug_selected", -1)
+            if 0 <= sel < len(cols):
+                _, _, _, txt = cols[sel]
+                if self._on_select:
+                    self._on_select(txt, shift_held=shift_held)
+                self._do_hide()
+        self._root.after(0, _update)
+
+    def debug_dismiss(self):
+        """Dismiss Multi-Model Preview without selecting."""
+        self._root.after(0, self._do_hide)
+
+    _PREVIEW_DIM = "#3a3c48"     # starting dim color
+    _PREVIEW_BRIGHT = "#d4d6de"  # final bright color
+
+    def _parse_hex(self, hex_color):
+        h = hex_color.lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+    def _lerp_color(self, c1, c2, t):
+        r = int(c1[0] + (c2[0] - c1[0]) * t)
+        g = int(c1[1] + (c2[1] - c1[1]) * t)
+        b = int(c1[2] + (c2[2] - c1[2]) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _set_preview_content(self, text, tag=None):
+        """Helper: replace all text in the preview Text widget."""
+        self._preview_text.config(state="normal")
+        self._preview_text.delete("1.0", "end")
+        if text:
+            self._preview_text.insert("1.0", text, tag or ())
+        self._preview_text.see("end")
+        self._preview_text.config(state="disabled")
+
+    def _get_preview_content(self):
+        """Helper: get current preview text."""
+        return self._preview_text.get("1.0", "end-1c")
+
+    def update_preview(self, text):
+        """Show or update live transcription text with fade-in animation."""
+        def _update():
+            if not text:
+                self._preview_frame.pack_forget()
+                self._position_bottom_center()
+                return
+
+            old_text = self._get_preview_content()
+            self._set_preview_content(text)
+
+            # Pack if not already visible
+            if not self._preview_frame.winfo_ismapped():
+                self._preview_frame.pack(side="right", padx=(8, 0), pady=4, fill="y")
+            self._position_bottom_center()
+
+            # Only animate if text actually changed
+            if text != old_text:
+                self._animate_preview_fade()
+
+        self._root.after(0, _update)
+
+    def _animate_preview_fade(self):
+        """Fade preview text from dim to bright over ~300ms."""
+        # Cancel any running fade
+        if hasattr(self, "_preview_fade_job") and self._preview_fade_job:
+            self._root.after_cancel(self._preview_fade_job)
+            self._preview_fade_job = None
+
+        dim = self._parse_hex(self._PREVIEW_DIM)
+        bright = self._parse_hex(self._PREVIEW_BRIGHT)
+        steps = 8
+        step_ms = 35  # ~280ms total
+        step_i = [0]
+
+        def _tick():
+            step_i[0] += 1
+            t = step_i[0] / steps
+            t = 1 - (1 - t) ** 2
+            color = self._lerp_color(dim, bright, t)
+            self._preview_text.config(fg=color)
+            if step_i[0] < steps:
+                self._preview_fade_job = self._root.after(step_ms, _tick)
+            else:
+                self._preview_fade_job = None
+
+        self._preview_text.config(fg=self._PREVIEW_DIM)
+        self._preview_fade_job = self._root.after(step_ms, _tick)
+
+    def update_preview_scratch(self, original_text, clean_text):
+        """Show scratch animation: kept text stays normal, removed text gets red strikethrough."""
+        def _do():
+            # Cancel any pending scratch or fade animations
+            if self._scratch_anim_job:
+                self._root.after_cancel(self._scratch_anim_job)
+                self._scratch_anim_job = None
+            if hasattr(self, "_preview_fade_job") and self._preview_fade_job:
+                self._root.after_cancel(self._preview_fade_job)
+                self._preview_fade_job = None
+
+            # Find common prefix and suffix to identify the removed portion
+            prefix_len = 0
+            for i in range(min(len(original_text), len(clean_text))):
+                if original_text[i] == clean_text[i]:
+                    prefix_len = i + 1
+                else:
+                    break
+
+            clean_rest = clean_text[prefix_len:]
+            if clean_rest and original_text.rstrip().endswith(clean_rest.rstrip()):
+                # There's text after the scratch too
+                suffix_start = len(original_text) - len(clean_rest)
+                removed = original_text[prefix_len:suffix_start]
+                after = original_text[suffix_start:]
+            else:
+                removed = original_text[prefix_len:]
+                after = ""
+
+            kept_before = original_text[:prefix_len]
+
+            # Phase 1: Show original with removed portion in red strikethrough
+            self._preview_text.config(state="normal")
+            self._preview_text.delete("1.0", "end")
+            if kept_before:
+                self._preview_text.insert("end", kept_before, "kept")
+            if removed:
+                self._preview_text.insert("end", removed, "scratched")
+            if after:
+                self._preview_text.insert("end", after, "kept")
+            self._preview_text.see("end")
+            self._preview_text.config(state="disabled")
+
+            # Ensure visible
+            if not self._preview_frame.winfo_ismapped():
+                self._preview_frame.pack(side="right", padx=(8, 0), pady=4, fill="y")
+            self._position_bottom_center()
+
+            # Phase 2: After 600ms, transition to clean text with fade-in
+            def _show_clean():
+                self._scratch_anim_job = None
+                if clean_text:
+                    self._set_preview_content(clean_text)
+                    self._animate_preview_fade()
+                else:
+                    self._set_preview_content("")
+                    self._preview_frame.pack_forget()
+                    self._position_bottom_center()
+
+            self._scratch_anim_job = self._root.after(600, _show_clean)
+
+        self._root.after(0, _do)
+
+    def set_display_font(self, font_family):
+        """Update the font on all text-display labels."""
+        self._preview_font = font_family
+        def _update():
+            self._label.config(font=(font_family, 18, "bold"))
+            self._timer_label.config(font=(font_family, 12))
+            self._preview_text.config(font=(font_family, 12))
+            self._orig_label.config(font=(font_family, 14))
+            self._clean_label.config(font=(font_family, 16, "bold"))
+        self._root.after(0, _update)
+
+    def hide_preview(self):
+        """Hide the live transcription preview panel."""
+        def _update():
+            if hasattr(self, "_preview_fade_job") and self._preview_fade_job:
+                self._root.after_cancel(self._preview_fade_job)
+                self._preview_fade_job = None
+            self._preview_frame.pack_forget()
+            self._position_bottom_center()
+        self._root.after(0, _update)
+
+    def start_idle_breathing(self):
+        """Show a gentle breathing animation on the pill when idle."""
+        def _start():
+            self._cancel_animations()
+            self._idle_phase = getattr(self, "_idle_phase", 0.0)
+
+            self._mic_label.pack_forget()
+            self._label.pack_forget()
+            self._timer_label.pack_forget()
+            self._preview_frame.pack_forget()
+            self._compare_frame.pack_forget()
+            self._debug_frame.pack_forget()
+
+            self._root.config(bg=self.TRANSPARENT)
+            self._frame.config(bg=self.TRANSPARENT)
+            self._root.attributes("-transparentcolor", self.TRANSPARENT)
+            self._mic_label.config(bg=self.TRANSPARENT)
+            self._mic_label.pack()
+            # Pack invisible timer spacer so idle height matches recording height
+            self._timer_label.config(text=" ", fg=self.TRANSPARENT, bg=self.TRANSPARENT)
+            self._timer_label.pack()
+
+            self._root.deiconify()
+            self._root.lift()
+            self._alpha = 0.4
+            self._root.attributes("-alpha", 0.4)
+            self._position_bottom_center()
+            self._idle_breathing_tick()
+
+        self._root.after(0, _start)
+
+    def _idle_breathing_tick(self):
+        self._idle_phase = getattr(self, "_idle_phase", 0.0) + 0.15
+        bars = _breathing_bars(self._idle_phase, num_bars=getattr(self, 'num_bars', NUM_BARS))
+        photo = self._build_waveform_photo(self._accent_hex, bar_heights=bars)
+        self._mic_label.config(image=photo)
+        self._mic_label._idle_photo = photo
+        self._idle_anim_job = self._root.after(60, self._idle_breathing_tick)
+
+    def stop_idle_breathing(self):
+        """Stop idle breathing animation."""
+        if hasattr(self, "_idle_anim_job") and self._idle_anim_job:
+            self._root.after_cancel(self._idle_anim_job)
+            self._idle_anim_job = None
+
     def hide(self):
         self._root.after(0, self._do_hide)
 
     def _do_hide(self):
         self._hide_timer = None
+        self.stop_idle_breathing()
         if self._fade_job is not None:
             self._root.after_cancel(self._fade_job)
             self._fade_job = None
@@ -333,12 +1283,106 @@ class Bubble:
 
 
 # ---------------------------------------------
+#  WebSocket bridge for dashboard integration
+# ---------------------------------------------
+class WebSocketBridge:
+    """WebSocket server that bridges whisper transcriptions to external apps."""
+
+    def __init__(self, port=WS_PORT):
+        self.port = port
+        self.clients = set()
+        self.loop = None
+        self.server = None
+        self._recording = False
+
+    @property
+    def has_clients(self):
+        return len(self.clients) > 0
+
+    async def _handler(self, websocket):
+        self.clients.add(websocket)
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+                    if msg_type == "start_recording":
+                        self._on_start_recording()
+                    elif msg_type == "stop_recording":
+                        self._on_stop_recording()
+                except json.JSONDecodeError:
+                    pass
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            self.clients.discard(websocket)
+
+    async def _serve(self):
+        try:
+            self.server = await websockets.serve(
+                self._handler, "localhost", self.port
+            )
+            print(f"[WS   ] WebSocket bridge listening on ws://localhost:{self.port}")
+            await self.server.wait_closed()
+        except OSError as e:
+            print(f"[WS   ] Failed to start on port {self.port}: {e}")
+
+    def start(self):
+        """Start the WebSocket server in a daemon thread."""
+        def _run():
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self._serve())
+
+        thread = threading.Thread(target=_run, daemon=True, name="ws-bridge")
+        thread.start()
+
+    def broadcast(self, message_dict):
+        """Send a JSON message to all connected clients."""
+        if not self.clients or not self.loop:
+            return
+        data = json.dumps(message_dict)
+        for client in list(self.clients):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    client.send(data), self.loop
+                )
+            except Exception:
+                self.clients.discard(client)
+
+    def broadcast_transcription(self, text):
+        """Broadcast a transcription result."""
+        self.broadcast({"type": "transcription", "text": text})
+
+    def broadcast_recording_started(self):
+        """Notify clients that recording has begun."""
+        self._recording = True
+        self.broadcast({"type": "recording_started"})
+
+    def broadcast_recording_stopped(self):
+        """Notify clients that recording has stopped."""
+        self._recording = False
+        self.broadcast({"type": "recording_stopped"})
+
+    def broadcast_error(self, message):
+        """Notify clients of an error."""
+        self.broadcast({"type": "error", "message": message})
+
+    # Callbacks set by WhisperTray
+    _on_start_recording = staticmethod(lambda: None)
+    _on_stop_recording = staticmethod(lambda: None)
+
+
+# ---------------------------------------------
 #  Main app
 # ---------------------------------------------
 class WhisperTray:
     COLOR_READY       = (76, 175, 80, 255)
     COLOR_RECORDING   = (244, 67, 54, 255)
     COLOR_TRANSCRIBING = (255, 193, 7, 255)
+
+    # Config file lives next to the script
+    _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper_type.json")
 
     def __init__(self):
         self.model = None
@@ -353,13 +1397,230 @@ class WhisperTray:
         # Device management
         self._cuda_available = detect_cuda()
         self._use_cuda = self._cuda_available  # default to GPU if available
+        self._cuda_verified = False  # cached CUDA test result
         self._hotkey = HOTKEY
         self._chime_enabled = False
+        self._llm_cleanup = LLM_CLEANUP
+        self._llm_model = LLM_MODEL
+        self._llm_prompt = LLM_DEFAULT_PROMPT
+        self._llm_debug = False
+        self._llm_preview_styles = list(LLM_PROMPTS.keys())  # All selected by default
+        self._auto_submit = False  # Press Enter after pasting from Multi-Model Preview
+        self._whisper_model = WHISPER_MODEL
+        self._tone_detect = False
+        self._translate_lang = None  # None = off, "Spanish" etc = on
+        self._bubble_duration = BUBBLE_DURATION
         self._privacy_mic = PRIVACY_MIC
+        self._remote_mode = REMOTE_MODE      # Route audio to Mac Mini STT server
+        self._remote_url = REMOTE_URL
+        self._remote_cleanup = REMOTE_CLEANUP
+        self._waveform_style = "Bars"  # "Bars", "Pixel", or "Wave"
+        self._color_theme = THEME_DEFAULT  # "Synthwave", "Windows Theme", etc.
+        self._num_bars = NUM_BARS  # Number of FFT bars to display
+        self._cells_per_bar = 4   # LED cells per half-bar in Pixel mode
+        self._display_font = "Segoe UI"  # Font for result text, timer, preview
+        self._live_preview = False  # Show live transcription while recording
+        self._live_stop = threading.Event()
+        self._live_transcribe_lock = threading.Lock()
+        self._auto_punctuate = False  # Lightweight auto-punctuation
+        self._confidence_coloring = False  # Tint low-confidence results
+        self._scratch_that = True  # "Scratch that" undo support
+        self._idle_breathing = False  # Idle breathing animation
+        self._tray_visualizer = False  # Animated FFT tray icon
+        self._tray_idle_stop = threading.Event()
+        self._tray_fft_stop = threading.Event()
+        # Dictation mode
+        self._dictation_hotkey = DICTATION_HOTKEY
+        self._is_dictation_mode = False
+        # Paste tracking for "scratch that"
+        self._last_pasted_text = ""
+        self._last_pasted_len = 0
+        # Confidence tracking
+        self._segment_logprobs = []
+        self._cancel_requested = False
+        self._recording_timer = None
+        # History log
+        self._history_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper_history.json")
+        self._history = []
+        self._load_history()
         # Streaming transcription state
         self._stream_text = ""
+        # Scratch-that live preview state: avoid re-transcribing already-scratched audio
+        self._scratch_clean_prefix = ""   # cached clean text up to last scratch
+        self._scratch_buf_offset = 0      # audio buffer chunks already processed before scratch
         self._stream_lock = threading.Lock()
         self._icon_lock = threading.Lock()
+        self._nav_hooks = []  # Multi-Model Preview keyboard hooks
+        self._ollama_ready = threading.Event()
+        self._ollama_ready.set()  # Ready by default (no warm-up pending)
+        # WebSocket bridge port
+        self._ws_port = WS_PORT
+        # Load saved settings (overrides defaults above)
+        self._load_config()
+        # WebSocket bridge for dashboard integration
+        self.ws_bridge = WebSocketBridge(port=self._ws_port)
+        # Wire recording control callbacks — go through on_key_down/on_key_up
+        # for guard logic, but dispatch to background threads to avoid blocking
+        # the asyncio event loop
+        self.ws_bridge._on_start_recording = lambda: threading.Thread(
+            target=self.on_key_down, daemon=True, name="ws-rec-start"
+        ).start()
+        self.ws_bridge._on_stop_recording = lambda: threading.Thread(
+            target=self.on_key_up, daemon=True, name="ws-rec-stop"
+        ).start()
+
+    def _load_config(self):
+        """Load persistent settings from JSON config file."""
+        try:
+            with open(self._config_path, "r") as f:
+                cfg = json.load(f)
+            self._hotkey = cfg.get("hotkey", self._hotkey)
+            self._chime_enabled = cfg.get("chime_enabled", self._chime_enabled)
+            self._llm_cleanup = cfg.get("llm_cleanup", self._llm_cleanup)
+            self._llm_model = cfg.get("llm_model", self._llm_model)
+            self._llm_prompt = cfg.get("llm_prompt", self._llm_prompt)
+            self._llm_debug = cfg.get("llm_debug", self._llm_debug)
+            saved_styles = cfg.get("llm_preview_styles", None)
+            if saved_styles is not None:
+                self._llm_preview_styles = [s for s in saved_styles if s in LLM_PROMPTS]
+                if not self._llm_preview_styles:
+                    self._llm_preview_styles = list(LLM_PROMPTS.keys())
+            self._auto_submit = cfg.get("auto_submit", self._auto_submit)
+            self._whisper_model = cfg.get("whisper_model", self._whisper_model)
+            self._tone_detect = cfg.get("tone_detect", self._tone_detect)
+            self._translate_lang = cfg.get("translate_lang", self._translate_lang)
+            self._bubble_duration = cfg.get("bubble_duration", self._bubble_duration)
+            self._privacy_mic = cfg.get("privacy_mic", self._privacy_mic)
+            self._remote_mode = cfg.get("remote_mode", self._remote_mode)
+            self._remote_url = cfg.get("remote_url", self._remote_url)
+            self._remote_cleanup = cfg.get("remote_cleanup", self._remote_cleanup)
+            self._waveform_style = cfg.get("waveform_style", self._waveform_style)
+            self._color_theme = cfg.get("color_theme", self._color_theme)
+            self._num_bars = cfg.get("num_bars", self._num_bars)
+            self._cells_per_bar = cfg.get("cells_per_bar", self._cells_per_bar)
+            self._display_font = cfg.get("display_font", self._display_font)
+            self._live_preview = cfg.get("live_preview", self._live_preview)
+            self._auto_punctuate = cfg.get("auto_punctuate", self._auto_punctuate)
+            self._confidence_coloring = cfg.get("confidence_coloring", self._confidence_coloring)
+            self._scratch_that = cfg.get("scratch_that", self._scratch_that)
+            self._idle_breathing = cfg.get("idle_breathing", self._idle_breathing)
+            self._tray_visualizer = cfg.get("tray_visualizer", self._tray_visualizer)
+            self._dictation_hotkey = cfg.get("dictation_hotkey", self._dictation_hotkey)
+            self._ws_port = cfg.get("ws_port", self._ws_port)
+            # Load custom prompts into LLM_PROMPTS
+            for name, template in cfg.get("custom_prompts", {}).items():
+                LLM_PROMPTS[name] = template
+            if self._cuda_available:
+                self._use_cuda = cfg.get("use_cuda", self._use_cuda)
+            self._cuda_verified = cfg.get("cuda_verified", False)
+            # Validate llm_prompt still exists
+            if self._llm_prompt not in LLM_PROMPTS:
+                self._llm_prompt = LLM_DEFAULT_PROMPT
+            print(f"[CONF ] Loaded settings from {self._config_path}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[CONF ] Failed to load config: {e}")
+
+    # -- Windows accent color polling ----------------------------------------
+    _ACCENT_POLL_SEC = 30
+
+    def _start_accent_poll(self):
+        """Begin periodic polling for Windows accent color changes."""
+        self._accent_poll_timer = threading.Timer(self._ACCENT_POLL_SEC, self._poll_accent_color)
+        self._accent_poll_timer.daemon = True
+        self._accent_poll_timer.start()
+
+    def _poll_accent_color(self):
+        """Check if the Windows accent color changed; update theme if so."""
+        try:
+            if self._color_theme != "Windows Theme":
+                return  # only poll when tracking the system theme
+            fresh = _get_windows_accent_color()
+            if fresh != Bubble._theme_rgb:
+                Bubble.set_theme("Windows Theme")
+        except Exception:
+            pass
+        finally:
+            # Re-arm the timer
+            self._accent_poll_timer = threading.Timer(self._ACCENT_POLL_SEC, self._poll_accent_color)
+            self._accent_poll_timer.daemon = True
+            self._accent_poll_timer.start()
+
+    def _save_config(self):
+        """Persist current settings to JSON config file."""
+        cfg = {
+            "hotkey": self._hotkey,
+            "chime_enabled": self._chime_enabled,
+            "use_cuda": self._use_cuda,
+            "llm_cleanup": self._llm_cleanup,
+            "llm_model": self._llm_model,
+            "llm_prompt": self._llm_prompt,
+            "llm_debug": self._llm_debug,
+            "llm_preview_styles": self._llm_preview_styles,
+            "auto_submit": self._auto_submit,
+            "whisper_model": self._whisper_model,
+            "tone_detect": self._tone_detect,
+            "translate_lang": self._translate_lang,
+            "bubble_duration": self._bubble_duration,
+            "privacy_mic": self._privacy_mic,
+            "remote_mode": self._remote_mode,
+            "remote_url": self._remote_url,
+            "remote_cleanup": self._remote_cleanup,
+            "waveform_style": self._waveform_style,
+            "color_theme": self._color_theme,
+            "num_bars": self._num_bars,
+            "cells_per_bar": self._cells_per_bar,
+            "display_font": self._display_font,
+            "live_preview": self._live_preview,
+            "auto_punctuate": self._auto_punctuate,
+            "confidence_coloring": self._confidence_coloring,
+            "scratch_that": self._scratch_that,
+            "idle_breathing": self._idle_breathing,
+            "tray_visualizer": self._tray_visualizer,
+            "dictation_hotkey": self._dictation_hotkey,
+            "ws_port": self._ws_port,
+            "cuda_verified": getattr(self, "_cuda_verified", False),
+        }
+        # Preserve custom_prompts if they exist in the file
+        try:
+            with open(self._config_path, "r") as f:
+                existing = json.load(f)
+            if "custom_prompts" in existing:
+                cfg["custom_prompts"] = existing["custom_prompts"]
+        except Exception:
+            pass
+        try:
+            with open(self._config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as e:
+            print(f"[CONF ] Failed to save config: {e}")
+
+    def _load_history(self):
+        try:
+            with open(self._history_path, "r") as f:
+                self._history = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._history = []
+
+    def _save_history(self):
+        try:
+            with open(self._history_path, "w") as f:
+                json.dump(self._history[-HISTORY_MAX:], f, indent=2)
+        except Exception as e:
+            print(f"[HIST ] Failed to save history: {e}")
+
+    def _add_history(self, raw, final, style=None, tone=None):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "raw": raw,
+            "final": final,
+            "style": style,
+            "tone": tone,
+        }
+        self._history.append(entry)
+        self._save_history()
+        print(f"[HIST ] Saved ({len(self._history)} entries)")
 
     @property
     def _device(self):
@@ -375,7 +1636,7 @@ class WhisperTray:
         test_script = (
             "import sys, tempfile, wave, numpy as np\n"
             "from faster_whisper import WhisperModel\n"
-            f"model = WhisperModel('{WHISPER_MODEL}', device='cuda', compute_type='float16')\n"
+            f"model = WhisperModel('{self._whisper_model}', device='cuda', compute_type='float16')\n"
             "path = tempfile.mktemp(suffix='.wav')\n"
             "pcm = np.zeros(16000, dtype=np.int16)\n"  # 1s silence
             "with wave.open(path, 'w') as wf:\n"
@@ -401,23 +1662,33 @@ class WhisperTray:
         from faster_whisper import WhisperModel
 
         if self._use_cuda:
-            print(f"[INIT ] CUDA detected, testing GPU inference...")
-            if self._test_cuda_inference():
-                print(f"[GPU  ] CUDA test passed.")
+            # Skip CUDA subprocess test if it passed before (cached in config)
+            if getattr(self, "_cuda_verified", False):
+                print(f"[GPU  ] CUDA previously verified, skipping test.")
             else:
-                print(f"[WARN ] CUDA test failed or timed out, using CPU instead.")
-                self._use_cuda = False
+                print(f"[INIT ] CUDA detected, testing GPU inference...")
+                if self._test_cuda_inference():
+                    print(f"[GPU  ] CUDA test passed.")
+                    self._cuda_verified = True
+                    self._save_config()
+                else:
+                    print(f"[WARN ] CUDA test failed or timed out, using CPU instead.")
+                    self._use_cuda = False
+                    self._cuda_verified = False
+                    self._save_config()
 
         device = self._device
         compute = self._compute_type
-        print(f"[INIT ] Loading Whisper '{WHISPER_MODEL}' on {device} ({compute})...")
+        print(f"[INIT ] Loading Whisper '{self._whisper_model}' on {device} ({compute})...")
         try:
-            self.model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+            self.model = WhisperModel(self._whisper_model, device=device, compute_type=compute)
         except Exception as e:
             if device == "cuda":
                 print(f"[WARN ] CUDA failed ({e}), falling back to CPU...")
                 self._use_cuda = False
-                self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                self._cuda_verified = False
+                self._save_config()
+                self.model = WhisperModel(self._whisper_model, device="cpu", compute_type="int8")
             else:
                 raise
         print(f"[READY] Model loaded on {self._device}. Hold {self._hotkey.upper()} to record.")
@@ -427,16 +1698,19 @@ class WhisperTray:
         from faster_whisper import WhisperModel
         device = self._device
         compute = self._compute_type
-        print(f"[INIT ] Reloading Whisper on {device} ({compute})...")
+        print(f"[INIT ] Reloading Whisper '{self._whisper_model}' on {device} ({compute})...")
+        self.bubble.show(f"Loading {self._whisper_model}...", style="transcribing")
         try:
-            self.model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+            self.model = WhisperModel(self._whisper_model, device=device, compute_type=compute)
             print(f"[READY] Model reloaded on {device}.")
+            self.bubble.show(f"{self._whisper_model} ready!", style="result", duration=2)
         except Exception as e:
             if device == "cuda":
                 print(f"[WARN ] CUDA failed ({e}), falling back to CPU...")
                 self._use_cuda = False
-                self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                self.model = WhisperModel(self._whisper_model, device="cpu", compute_type="int8")
                 print(f"[READY] Model reloaded on CPU.")
+                self.bubble.show(f"{self._whisper_model} ready (CPU)", style="result", duration=2)
             else:
                 raise
         self._rebuild_tray_menu()
@@ -453,11 +1727,11 @@ class WhisperTray:
     def set_icon(self, color):
         if self.tray:
             if not self._icon_lock.acquire(timeout=2):
-                return
+                return  # another thread is updating the icon — skip
             try:
                 self.tray.icon = make_icon_image(color)
             except (PermissionError, OSError):
-                pass
+                pass  # temp .ico file locked — skip update
             finally:
                 self._icon_lock.release()
 
@@ -494,12 +1768,13 @@ class WhisperTray:
             self._viz_buffer[-n:] = mono
 
     def get_fft_bars(self):
+        n = self._num_bars
         window = np.hanning(FFT_CHUNK)
         spectrum = np.abs(np.fft.rfft(self._viz_buffer * window))
         freqs = np.fft.rfftfreq(FFT_CHUNK, 1.0 / SAMPLE_RATE)
-        edges = np.logspace(np.log10(60), np.log10(7500), NUM_BARS + 1)
+        edges = np.logspace(np.log10(60), np.log10(7500), n + 1)
         bars = []
-        for i in range(NUM_BARS):
+        for i in range(n):
             mask = (freqs >= edges[i]) & (freqs < edges[i + 1])
             if mask.any():
                 bars.append(float(np.mean(spectrum[mask])))
@@ -522,41 +1797,253 @@ class WhisperTray:
             tmp_path = f.name
         try:
             self.write_wav(tmp_path, audio_np)
-            lang = "en" if WHISPER_MODEL.endswith(".en") else None
+            lang = "en" if self._whisper_model.endswith(".en") else None
             segments, _ = self.model.transcribe(
-                tmp_path, beam_size=3, language=lang, vad_filter=True,
+                tmp_path, beam_size=3, language=lang,
+                vad_filter=True,
             )
             text = " ".join(s.text.strip() for s in segments).strip()
         finally:
             os.unlink(tmp_path)
         return text
 
+    def transcribe_remote(self, audio_np):
+        """POST the recorded clip to the Mac STT server; return the text to paste."""
+        import io, wave, requests
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(SAMPLE_RATE)
+            pcm16 = np.clip(audio_np, -1, 1)
+            wf.writeframes((pcm16 * 32767).astype("<i2").tobytes())
+        buf.seek(0)
+        resp = requests.post(
+            f"{self._remote_url}/transcribe",
+            files={"file": ("clip.wav", buf, "audio/wav")},
+            data={"cleanup": self._remote_cleanup},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["text"]
+
     def transcribe_streaming(self, audio_np):
         """Transcribe and update the bubble progressively as segments arrive."""
+        self._streaming_done = False
+        self._segment_logprobs = []
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_path = f.name
         try:
             self.write_wav(tmp_path, audio_np)
-            lang = "en" if WHISPER_MODEL.endswith(".en") else None
+            lang = "en" if self._whisper_model.endswith(".en") else None
             segments, _ = self.model.transcribe(
-                tmp_path, beam_size=3, language=lang, vad_filter=True,
+                tmp_path, beam_size=3, language=lang,
+                vad_filter=True,
             )
             parts = []
             for seg in segments:
                 parts.append(seg.text.strip())
+                self._segment_logprobs.append(seg.avg_logprob)
                 text_so_far = " ".join(parts)
                 with self._stream_lock:
                     self._stream_text = text_so_far
-                if BUBBLE_DURATION > 0:
-                    self.bubble.show(text_so_far, style="result", duration=None)
+                if self._bubble_duration > 0 and not self._streaming_done:
+                    self.bubble.show(text_so_far, style="transcribing")
         finally:
+            self._streaming_done = True
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
         return self._stream_text
 
+    def _live_preview_loop(self):
+        """Periodically transcribe accumulated audio and show preview while recording."""
+        log.debug("_live_preview_loop START")
+        # Wait a bit before first attempt so there's enough audio
+        if self._live_stop.wait(timeout=2.0):
+            log.debug("_live_preview_loop: stopped before first chunk")
+            return
+        while not self._live_stop.is_set():
+            buf_copy = list(self.audio_buffer)
+            # After a scratch, only transcribe audio recorded AFTER the scratch point
+            offset = self._scratch_buf_offset
+            new_chunks = buf_copy[offset:]
+            if len(new_chunks) < 2:  # need some audio
+                if self._live_stop.wait(timeout=1.0):
+                    break
+                continue
+            audio_snapshot = np.concatenate(new_chunks)
+            if len(audio_snapshot) < SAMPLE_RATE:  # less than 1 second
+                if self._live_stop.wait(timeout=1.0):
+                    break
+                continue
+            # Non-blocking: skip if previous chunk still transcribing
+            if not self._live_transcribe_lock.acquire(blocking=False):
+                log.debug("_live_preview_loop: skipping (lock held)")
+                if self._live_stop.wait(timeout=1.0):
+                    break
+                continue
+            try:
+                new_text = self._transcribe_fast(audio_snapshot)
+                prefix = self._scratch_clean_prefix
+                # Combine cached prefix with newly transcribed text
+                if prefix and new_text:
+                    text = prefix + " " + new_text
+                else:
+                    text = prefix or new_text or ""
+
+                if text and not self._live_stop.is_set():
+                    # Apply inline scratch-that
+                    if self._scratch_that:
+                        clean_text, scratched = self._apply_scratch_that(text)
+                        if scratched:
+                            log.debug(f"_live_preview: scratch applied → '{clean_text[:60]}'")
+                            # Cache the clean text and mark current buffer position
+                            self._scratch_clean_prefix = clean_text
+                            self._scratch_buf_offset = len(buf_copy)
+                            # Show original with red strikethrough on removed parts
+                            self.bubble.update_preview_scratch(text, clean_text)
+                            if self._live_stop.wait(timeout=2.0):
+                                break
+                            continue
+                        text = clean_text
+                    log.debug(f"_live_preview: '{text[:60]}'")
+                    self.bubble.update_preview(text)
+            except Exception as e:
+                log.debug(f"_live_preview_loop error: {e}")
+            finally:
+                self._live_transcribe_lock.release()
+            # Wait before next chunk
+            if self._live_stop.wait(timeout=2.0):
+                break
+        log.debug("_live_preview_loop DONE")
+
+    def _transcribe_fast(self, audio_np):
+        """Fast transcription for live preview (beam_size=1, no VAD)."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        try:
+            self.write_wav(tmp_path, audio_np)
+            lang = "en" if self._whisper_model.endswith(".en") else None
+            segments, _ = self.model.transcribe(
+                tmp_path, beam_size=1, language=lang,
+                vad_filter=False,
+            )
+            text = " ".join(s.text.strip() for s in segments).strip()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return text
+
+    def _ollama_post(self, path, payload_dict, timeout=30):
+        """Low-level HTTP POST to Ollama using http.client (no urllib global state)."""
+        parsed = urlparse(OLLAMA_URL)
+        model = payload_dict.get("model", "?")
+        log.debug(f"OLLAMA POST {path} model={model} timeout={timeout} connecting...")
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+        try:
+            body = json.dumps(payload_dict).encode("utf-8")
+            log.debug(f"OLLAMA POST {path} sending {len(body)}B...")
+            conn.request("POST", path, body=body, headers={
+                "Content-Type": "application/json",
+                "Connection": "close",
+            })
+            log.debug(f"OLLAMA POST {path} waiting for response...")
+            resp = conn.getresponse()
+            log.debug(f"OLLAMA POST {path} status={resp.status}, reading body...")
+            data = resp.read()
+            log.debug(f"OLLAMA POST {path} got {len(data)}B response")
+            return json.loads(data.decode("utf-8"))
+        finally:
+            conn.close()
+            log.debug(f"OLLAMA POST {path} connection closed")
+
+    def _ollama_get(self, path, timeout=3):
+        """Low-level HTTP GET to Ollama."""
+        parsed = urlparse(OLLAMA_URL)
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"Connection": "close"})
+            resp = conn.getresponse()
+            data = resp.read()
+            return json.loads(data.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def _call_ollama(self, prompt_text, max_tokens=256):
+        """Send a prompt to Ollama and return the response text."""
+        result = self._ollama_post("/api/generate", {
+            "model": self._llm_model,
+            "prompt": prompt_text,
+            "stream": False,
+            "options": {"temperature": LLM_TEMPERATURE, "num_predict": max_tokens},
+        })
+        text = result.get("response", "").strip()
+        # Strip wrapping quotes the model sometimes adds
+        if len(text) >= 2 and text[0] in ('"', '\u201c') and text[-1] in ('"', '\u201d'):
+            text = text[1:-1].strip()
+        return text
+
+    def cleanup_text(self, text, prompt_name=None):
+        """Send text to Ollama for cleanup using the selected prompt personality."""
+        log.debug(f"cleanup_text({prompt_name}): waiting for ollama_ready...")
+        self._ollama_ready.wait(timeout=30)
+        name = prompt_name or self._llm_prompt
+        log.debug(f"cleanup_text({name}): calling ollama...")
+        prompt_template = LLM_PROMPTS[name]
+        prompt = prompt_template.format(text=text)
+        try:
+            cleaned = self._call_ollama(prompt)
+            return cleaned if cleaned else text
+        except Exception as e:
+            print(f"[LLM  ] Cleanup failed ({name}): {e}")
+            return text
+
+    def cleanup_text_all(self, text):
+        """Run selected prompt personalities in parallel. Returns dict of {name: result}."""
+        # Wait for warm-up to finish so we don't compete with it for Ollama
+        log.debug("cleanup_text_all: waiting for ollama_ready...")
+        self._ollama_ready.wait(timeout=30)
+        log.debug("cleanup_text_all: ollama_ready OK")
+        styles = self._llm_preview_styles if self._llm_preview_styles else list(LLM_PROMPTS.keys())
+        log.debug(f"cleanup_text_all: styles={styles}")
+        results = {}
+        lock = threading.Lock()
+        done = threading.Event()
+
+        def _run(name):
+            log.debug(f"cleanup_text_all._run({name}) START")
+            result = self.cleanup_text(text, prompt_name=name)
+            log.debug(f"cleanup_text_all._run({name}) DONE: {result[:50] if result else '?'}")
+            with lock:
+                results[name] = result
+                log.debug(f"cleanup_text_all: {len(results)}/{len(styles)} complete")
+                if len(results) == len(styles):
+                    done.set()
+
+        threads = [threading.Thread(target=_run, args=(name,), daemon=True, name=f"LLM-{name}") for name in styles]
+        for t in threads:
+            t.start()
+        # Single deadline for all threads instead of per-thread timeout
+        log.debug("cleanup_text_all: waiting for all threads (30s deadline)...")
+        done.wait(timeout=30)
+        log.debug(f"cleanup_text_all: done.is_set={done.is_set()}, results={list(results.keys())}")
+        # Fill in any that didn't finish
+        for name in styles:
+            if name not in results:
+                log.warning(f"cleanup_text_all: {name} TIMED OUT")
+                results[name] = "(timed out)"
+        return results
+
     def paste_text(self, text):
+        # Dashboard mode: broadcast via WebSocket, skip clipboard/paste
+        if self.ws_bridge.has_clients:
+            self.ws_bridge.broadcast_transcription(text)
+            return
+
         import pyperclip
         import pyautogui
         pyperclip.copy(text)
@@ -565,64 +2052,531 @@ class WhisperTray:
         if APPEND_ENTER:
             time.sleep(0.05)
             pyautogui.press("enter")
+        # Track for "scratch that"
+        self._last_pasted_text = text
+        self._last_pasted_len = len(text) + (1 if APPEND_ENTER else 0)
+
+    _SCRATCH_TRIGGERS = [
+        "scratch that", "scratch this", "undo that", "undo this",
+        "never mind", "nevermind", "delete that", "erase that",
+        "take that back", "remove that",
+    ]
+
+    def _apply_scratch_that(self, text):
+        """Process text inline: find 'scratch that' triggers and remove the
+        preceding sentence for each occurrence.  Returns (cleaned_text, had_scratch).
+
+        Example:
+          "The meeting was great. The cake was bad. Scratch that. Let's move on."
+        → ("The meeting was great. Let's move on.", True)
+        """
+        import re
+        if not text:
+            return text, False
+
+        had_scratch = False
+        # Build a regex that matches any trigger (case-insensitive), possibly
+        # preceded by filler words and surrounded by punctuation/spaces
+        filler = r'(?:(?:um+|uh+|oh+|ah+|okay|ok|so|well|hey|actually|please|yeah)[,\s]*)*'
+        trigger_pattern = '|'.join(re.escape(t) for t in self._SCRATCH_TRIGGERS)
+        # Match: optional leading punct/space, optional filler, the trigger, optional trailing punct/space
+        pattern = re.compile(
+            r'[,.\s]*' + filler + r'(' + trigger_pattern + r')[.,!?\s]*',
+            re.IGNORECASE,
+        )
+
+        # Process from right to left so indices stay valid
+        matches = list(pattern.finditer(text))
+        for match in reversed(matches):
+            had_scratch = True
+            before = text[:match.start()]
+            after = text[match.end():]
+
+            # Remove the last sentence from 'before'
+            # Split on sentence-ending punctuation followed by space
+            before = before.rstrip()
+            if before:
+                # Find the last sentence boundary (.!? followed by space or end)
+                sent_boundaries = list(re.finditer(r'[.!?]\s+', before))
+                if sent_boundaries:
+                    # Keep everything up to and including the last boundary
+                    cut_point = sent_boundaries[-1].end()
+                    before = before[:cut_point].rstrip()
+                else:
+                    # No sentence boundary — the whole 'before' is one sentence, remove it all
+                    before = ""
+
+            text = (before + " " + after).strip() if before and after else (before or after).strip()
+
+        return text, had_scratch
+
+    def _undo_last_paste(self):
+        """Remove the previously pasted text by selecting it backwards and deleting."""
+        if self._last_pasted_len == 0:
+            return
+        import pyautogui
+        # Shift+Left to select the pasted text, then delete — much faster than
+        # individual backspaces for long text
+        for _ in range(self._last_pasted_len):
+            pyautogui.hotkey("shift", "left")
+        pyautogui.press("delete")
+        self._last_pasted_len = 0
+        self._last_pasted_text = ""
+
+    def _is_low_confidence(self):
+        """Check if the transcription had low confidence."""
+        if not self._segment_logprobs:
+            return False
+        avg = sum(self._segment_logprobs) / len(self._segment_logprobs)
+        return avg < -0.8
+
+    def on_dictation_toggle(self):
+        """Toggle dictation mode on/off (press once to start, again to stop)."""
+        if not self.is_recording:
+            self._is_dictation_mode = True
+            self.on_key_down()
+        elif self._is_dictation_mode:
+            self._is_dictation_mode = False
+            self.on_key_up()
+
+    # -- Tray visualizer --
+
+    def _start_tray_fft(self):
+        """Start animating the tray icon with live FFT data."""
+        if not self._tray_visualizer:
+            return
+        self._tray_idle_stop.set()
+        self._tray_fft_stop.clear()
+
+        def _loop():
+            while not self._tray_fft_stop.wait(timeout=0.2):
+                try:
+                    bars = self.get_fft_bars()
+                    icon = make_tray_fft_icon(bars)
+                    if self._icon_lock.acquire(timeout=1):
+                        try:
+                            self.tray.icon = icon
+                        finally:
+                            self._icon_lock.release()
+                except Exception:
+                    pass
+        threading.Thread(target=_loop, daemon=True, name="tray-fft").start()
+
+    def _start_tray_idle(self):
+        """Start the tray idle breathing animation."""
+        if not self._tray_visualizer:
+            return
+        self._tray_fft_stop.set()
+        self._tray_idle_stop.clear()
+
+        def _loop():
+            phase = 0.0
+            while not self._tray_idle_stop.wait(timeout=0.33):
+                try:
+                    bars = _breathing_bars(phase)
+                    icon = make_tray_fft_icon(bars, dim=True)
+                    if self._icon_lock.acquire(timeout=1):
+                        try:
+                            self.tray.icon = icon
+                        finally:
+                            self._icon_lock.release()
+                    phase += 0.15
+                except Exception:
+                    pass
+        threading.Thread(target=_loop, daemon=True, name="tray-idle").start()
+
+    def _stop_tray_animations(self):
+        self._tray_fft_stop.set()
+        self._tray_idle_stop.set()
+
+    def _cancel_recording(self):
+        """Cancel the current recording without transcribing."""
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        if self._privacy_mic:
+            threading.Thread(target=self._close_audio_stream, daemon=True, name="close-stream").start()
+        self._cancel_requested = True
+        self._is_dictation_mode = False
+        self._live_stop.set()
+        self.audio_buffer.clear()
+        self.set_icon(self.COLOR_READY)
+        self.bubble.hide_preview()
+        self.bubble.show("Cancelled", style="transcribing", duration=1)
+        print("[CANCEL] Recording cancelled.")
+
+    def _start_recording_timer(self):
+        """Show and update the timer label every second."""
+        def _tick():
+            if not self.is_recording:
+                return
+            elapsed = time.time() - self.start_time
+            mins, secs = divmod(int(elapsed), 60)
+            self.bubble._root.after(0, lambda m=mins, s=secs: (
+                self.bubble._timer_label.config(text=f"{m}:{s:02d}"),
+            ))
+            self._recording_timer = threading.Timer(1.0, _tick)
+            self._recording_timer.daemon = True
+            self._recording_timer.start()
+        self._recording_timer = threading.Timer(1.0, _tick)
+        self._recording_timer.daemon = True
+        self._recording_timer.start()
 
     def on_key_down(self):
+        log.debug("on_key_down START")
         if self.is_recording:
+            log.debug("on_key_down SKIP (already recording)")
             return
+        # Mark recording immediately to prevent re-entry from key repeats
         self.is_recording = True
+        # Run the rest off the keyboard thread to avoid blocking it
         threading.Thread(target=self._do_key_down, daemon=True, name="key-down").start()
 
     def _do_key_down(self):
         try:
+            log.debug("_do_key_down START")
             if self._privacy_mic:
+                log.debug("_do_key_down: opening stream")
                 self._open_audio_stream()
+            self._cancel_requested = False
             self.audio_buffer.clear()
             self._viz_buffer[:] = 0
             self._stream_text = ""
+            self._scratch_clean_prefix = ""
+            self._scratch_buf_offset = 0
             self.start_time = time.time()
             self.set_icon(self.COLOR_RECORDING)
-            self.bubble.show("Recording...", style="recording")
+            self._start_tray_fft()
+            self.bubble.show("0:00", style="recording")
             self.play_chime(CHIME_START)
+            self._start_recording_timer()
+            # Notify WebSocket clients that recording has started
+            if self.ws_bridge.has_clients:
+                self.ws_bridge.broadcast_recording_started()
+            # Start live transcription preview if enabled
+            if self._live_preview:
+                self._live_stop.clear()
+                threading.Thread(target=self._live_preview_loop, daemon=True, name="live-preview").start()
+            # Clean up any stale debug nav hooks from previous multi-model preview
+            self._cleanup_nav_hooks_async()
+            log.debug("_do_key_down DONE")
         except Exception:
+            log.exception("_do_key_down FAILED")
             self.is_recording = False
 
     def on_key_up(self):
-        if not self.is_recording:
+        log.debug("on_key_up START")
+        if self._is_dictation_mode:
+            log.debug("on_key_up SKIP (dictation mode active)")
+            return
+        if not self.is_recording and not self._cancel_requested:
+            log.debug("on_key_up SKIP (not recording)")
             return
         self.is_recording = False
+        self._live_stop.set()  # signal live preview loop to exit
+        # Run the rest off the keyboard thread to avoid blocking it
         threading.Thread(target=self._do_key_up, daemon=True, name="key-up").start()
 
     def _do_key_up(self):
+        log.debug("_do_key_up START")
+        self.bubble.hide_preview()
         if self._privacy_mic:
             self._close_audio_stream()
+        if self._recording_timer:
+            self._recording_timer.cancel()
+            self._recording_timer = None
+        if self._cancel_requested:
+            self._cancel_requested = False
+            return
+
+        # Notify WebSocket clients that recording has stopped
+        if self.ws_bridge.has_clients:
+            self.ws_bridge.broadcast_recording_stopped()
+
+        # Wait for any in-flight live transcription to finish before starting
+        # the final transcription — concurrent model.transcribe() calls produce
+        # corrupted/partial results
+        self._live_transcribe_lock.acquire()
+        self._live_transcribe_lock.release()
+
         elapsed = time.time() - self.start_time
+        log.debug(f"_do_key_up: elapsed={elapsed:.2f}, buffer={len(self.audio_buffer)}")
 
         if elapsed < 0.3 or not self.audio_buffer:
             self.set_icon(self.COLOR_READY)
             self.bubble.hide()
             return
 
+        log.debug("_do_key_up: set_icon TRANSCRIBING")
         self.set_icon(self.COLOR_TRANSCRIBING)
+        log.debug("_do_key_up: bubble show")
         self.bubble.show("Transcribing...", style="transcribing")
-        audio_np = np.concatenate(self.audio_buffer)
-        peak = np.max(np.abs(audio_np))
-        rms = np.sqrt(np.mean(audio_np ** 2))
-        print(f"[AUDIO] {elapsed:.1f}s, {len(audio_np)} samples, peak={peak:.4f}, rms={rms:.4f}")
+        log.debug("_do_key_up: concat audio")
+
+        # If scratch was applied during live preview, split audio at the scratch
+        # boundary so the scratched content is never re-transcribed. This avoids
+        # relying on regex matching a second time on beam_size=3 output.
+        scratch_prefix = ""
+        if self._scratch_that and self._scratch_buf_offset > 0:
+            buf_list = list(self.audio_buffer)
+            pre_chunks = buf_list[:self._scratch_buf_offset]
+            post_chunks = buf_list[self._scratch_buf_offset:]
+            if pre_chunks:
+                pre_audio = np.concatenate(pre_chunks)
+                print(f"[SCRATCH] Re-transcribing pre-scratch audio ({len(pre_chunks)} chunks)")
+                pre_text = self.transcribe_streaming(pre_audio)
+                if pre_text:
+                    # Apply scratch to pre-scratch audio (contains trigger + scratched sentence)
+                    pre_text, _ = self._apply_scratch_that(pre_text)
+                scratch_prefix = pre_text or ""
+            if post_chunks:
+                audio_np = np.concatenate(post_chunks)
+            else:
+                audio_np = None
+        else:
+            audio_np = np.concatenate(self.audio_buffer)
+
+        if audio_np is not None:
+            peak = np.max(np.abs(audio_np))
+            rms = np.sqrt(np.mean(audio_np ** 2))
+            print(f"[AUDIO] {elapsed:.1f}s, {len(audio_np)} samples, peak={peak:.4f}, rms={rms:.4f}")
 
         def _do_transcribe():
-            text = self.transcribe_streaming(audio_np)
-            if text:
-                print(f"[TEXT ] {text}")
-                self.play_chime(CHIME_DONE)
-                if BUBBLE_DURATION > 0:
-                    self.bubble.show(text, style="result", duration=BUBBLE_DURATION)
+            log.debug("_do_transcribe START")
+            try:
+                if audio_np is not None:
+                    if self._remote_mode:
+                        try:
+                            log.debug("transcribe_remote START")
+                            post_text = self.transcribe_remote(audio_np)
+                            log.debug(f"transcribe_remote DONE: '{post_text[:80] if post_text else ''}'")
+                        except Exception as e:
+                            print(f"[remote] failed, falling back to local: {e}")
+                            log.warning(f"remote transcribe failed, local fallback: {e}")
+                            post_text = self.transcribe_streaming(audio_np)
+                    else:
+                        log.debug("transcribe_streaming START")
+                        post_text = self.transcribe_streaming(audio_np)
+                        log.debug(f"transcribe_streaming DONE: '{post_text[:80] if post_text else ''}'")
                 else:
-                    self.bubble.hide()
-                self.paste_text(text)
+                    post_text = ""
+            except Exception as e:
+                log.exception("Transcription failed")
+                if self.ws_bridge.has_clients:
+                    self.ws_bridge.broadcast_error(str(e))
+                self.set_icon(self.COLOR_READY)
+                self.bubble.show("Transcription error", style="transcribing", duration=2.0)
+                return
+
+            # Combine scratch prefix with post-scratch transcription
+            if scratch_prefix and post_text:
+                raw_text = scratch_prefix + " " + post_text
+            elif scratch_prefix:
+                raw_text = scratch_prefix
+            else:
+                raw_text = post_text
+
+            if raw_text:
+                print(f"[TEXT ] {raw_text}")
+
+                # Inline "scratch that" — catch any NEW triggers in post-scratch text
+                if self._scratch_that:
+                    raw_text, had_scratch = self._apply_scratch_that(raw_text)
+                    if had_scratch:
+                        print(f"[SCRATCH] Applied inline scratch → '{raw_text}'")
+                    if not raw_text:
+                        # Everything was scratched — nothing left to paste
+                        self.play_chime(CHIME_DONE)
+                        self.bubble.show("Scratched!", style="result", duration=1.5)
+                        self.set_icon(self.COLOR_READY)
+                        self._start_tray_idle()
+                        if self._idle_breathing:
+                            self.bubble._root.after(2000, lambda: self.bubble.start_idle_breathing()
+                                                    if not self.is_recording else None)
+                        return
+
+                # Auto-punctuation (before LLM)
+                if self._auto_punctuate:
+                    raw_text = auto_punctuate(raw_text)
+                    print(f"[PUNCT] {raw_text}")
+
+                # Confidence check
+                low_conf = self._confidence_coloring and self._is_low_confidence()
+                if low_conf:
+                    avg_lp = sum(self._segment_logprobs) / len(self._segment_logprobs)
+                    print(f"[CONF ] Low confidence (avg_logprob={avg_lp:.2f})")
+
+                # Tone detection setup
+                tone_emoji = None
+                tone_result = [None]
+                valid_emojis = {"\u2753", "\u2757", "\U0001f4a1", "\U0001f600",
+                                "\U0001f614", "\U0001f4cb", "\U0001f914", "\U0001f525"}
+                def _detect_tone_sync():
+                    try:
+                        prompt = TONE_PROMPT.format(text=raw_text)
+                        raw_tone = self._call_ollama(prompt).strip()
+                        for ch in raw_tone:
+                            if ch in valid_emojis:
+                                tone_result[0] = ch
+                                return
+                        if raw_tone and ord(raw_tone[0]) > 127:
+                            tone_result[0] = raw_tone[0]
+                    except Exception as e:
+                        print(f"[TONE ] Detection failed: {e}")
+
+                # For non-debug paths, run tone in parallel with cleanup
+                tone_thread = None
+                if self._tone_detect and not self._llm_debug:
+                    tone_thread = threading.Thread(target=_detect_tone_sync, daemon=True)
+                    tone_thread.start()
+
+                if self._llm_debug:
+                    # Multi-Model Preview: run all prompts, let user pick
+                    import keyboard as kb
+                    log.debug("cleanup_text_all START (multi-model)")
+                    all_results = self.cleanup_text_all(raw_text)
+                    log.debug(f"cleanup_text_all DONE: {list(all_results.keys())}")
+                    for name, result in all_results.items():
+                        print(f"[LLM  ] {name}: {result}")
+                    # Run tone detection after multi-model (avoids extra concurrent Ollama connections)
+                    detected_tone = None
+                    if self._tone_detect:
+                        log.debug("tone_detect START")
+                        _detect_tone_sync()
+                        log.debug("tone_detect DONE")
+                        detected_tone = tone_result[0]
+                        if detected_tone:
+                            print(f"[TONE ] {detected_tone}")
+                            all_results = {name: f"{detected_tone} {txt}" for name, txt in all_results.items()}
+                    # Save the foreground window so we can restore it on select
+                    user32 = ctypes.windll.user32
+                    saved_hwnd = user32.GetForegroundWindow()
+
+                    def _restart_idle_after_debug():
+                        """Restart idle animations after debug selection/dismiss."""
+                        self._start_tray_idle()
+                        if self._idle_breathing:
+                            self.bubble._root.after(1500, lambda: self.bubble.start_idle_breathing()
+                                                    if not self.is_recording else None)
+
+                    def _on_debug_select(selected_text, shift_held=False):
+                        import pyautogui
+                        print(f"[LLM  ] Selected (shift={shift_held}): {selected_text}")
+                        self._cleanup_nav_hooks_async()
+                        _restart_idle_after_debug()
+                        # Run paste on a background thread to avoid blocking tkinter
+                        def _do_paste():
+                            time.sleep(0.1)
+                            user32.SetForegroundWindow(saved_hwnd)
+                            time.sleep(0.1)
+                            self.paste_text(selected_text)
+                            if self._auto_submit and not shift_held:
+                                time.sleep(0.05)
+                                pyautogui.press("enter")
+                        threading.Thread(target=_do_paste, daemon=True).start()
+
+                    _shift_state = [False]
+
+                    def _on_nav_key(e):
+                        # Track shift state from the hook itself
+                        if e.name in ("shift", "left shift", "right shift"):
+                            _shift_state[0] = (e.event_type == "down")
+                            return
+                        if e.event_type != "down":
+                            return
+                        if e.name in ("right", "down"):
+                            self.bubble.debug_navigate(1)
+                        elif e.name in ("left", "up"):
+                            self.bubble.debug_navigate(-1)
+                        elif e.name == "enter":
+                            self._cleanup_nav_hooks_async()
+                            self.bubble.debug_confirm(shift_held=_shift_state[0])
+                        elif e.name == "esc":
+                            self._cleanup_nav_hooks_async()
+                            self.bubble.debug_dismiss()
+                            _restart_idle_after_debug()
+
+                    self._nav_hooks = [kb.hook(_on_nav_key, suppress=True)]
+                    self.bubble._on_select = _on_debug_select
+                    self.play_chime(CHIME_DONE)
+                    original_display = f"{detected_tone} {raw_text}" if detected_tone else raw_text
+                    self.bubble.show(None, style="debug", original=original_display, debug_results=all_results)
+                    # Debug mode stays open until user picks — skip idle animations
+                    # (they get cleaned up when user selects/dismisses via nav hooks)
+                    self.set_icon(self.COLOR_READY)
+                    self._add_history(
+                        raw=raw_text,
+                        final="(preview mode)",
+                        style=self._llm_prompt if self._llm_cleanup else None,
+                        tone=detected_tone,
+                    )
+                    log.debug("_do_transcribe DONE (debug mode, waiting for selection)")
+                    return
+                elif self._llm_cleanup:
+                    log.debug("cleanup_text START (single-model)")
+                    cleaned = self.cleanup_text(raw_text)
+                    log.debug(f"cleanup_text DONE: '{cleaned[:80] if cleaned else ''}'")
+                    if cleaned != raw_text:
+                        print(f"[LLM  ] {cleaned}")
+                    final_text = cleaned
+                    # Translation pass
+                    if self._translate_lang:
+                        try:
+                            prompt = TRANSLATE_PROMPT.format(language=self._translate_lang, text=final_text)
+                            translated = self._call_ollama(prompt)
+                            if translated:
+                                print(f"[TRANS] {translated}")
+                                final_text = translated
+                        except Exception as e:
+                            print(f"[TRANS] Failed: {e}")
+                    # Tone prefix
+                    if self._tone_detect:
+                        tone_thread.join(timeout=3)
+                        tone_emoji = tone_result[0]
+                        if tone_emoji:
+                            final_text = f"{tone_emoji} {final_text}"
+                            print(f"[TONE ] {tone_emoji}")
+                    log.debug("paste_text START (single-model)")
+                    self.play_chime(CHIME_DONE)
+                    self.paste_text(final_text)
+                    log.debug("paste_text DONE")
+                    if final_text != raw_text and self._bubble_duration > 0:
+                        self.bubble.show(final_text, style="compare", duration=self._bubble_duration,
+                                         original=raw_text, low_confidence=low_conf)
+                    elif self._bubble_duration > 0:
+                        self.bubble.show(final_text, style="result", duration=self._bubble_duration,
+                                         low_confidence=low_conf)
+                    else:
+                        self.bubble.hide()
+                else:
+                    final_text = raw_text
+                    self.play_chime(CHIME_DONE)
+                    self.paste_text(final_text)
+                    if self._bubble_duration > 0:
+                        self.bubble.show(final_text, style="result", duration=self._bubble_duration,
+                                         low_confidence=low_conf)
+                    else:
+                        self.bubble.hide()
+
+                # Log to history
+                self._add_history(
+                    raw=raw_text,
+                    final=final_text if not self._llm_debug else "(preview mode)",
+                    style=self._llm_prompt if self._llm_cleanup else None,
+                    tone=tone_emoji,
+                )
             else:
                 print("[EMPTY] Nothing transcribed.")
                 self.bubble.show("(nothing heard)", style="transcribing", duration=1.5)
+            log.debug("_do_transcribe: set_icon READY")
             self.set_icon(self.COLOR_READY)
+            self._start_tray_idle()
+            # Restart idle breathing after bubble duration
+            if self._idle_breathing:
+                delay = int((self._bubble_duration + 0.5) * 1000) if self._bubble_duration > 0 else 500
+                self.bubble._root.after(delay, lambda: self.bubble.start_idle_breathing()
+                                        if not self.is_recording else None)
+            log.debug("_do_transcribe DONE")
 
         threading.Thread(target=_do_transcribe, daemon=True).start()
 
@@ -645,6 +2599,27 @@ class WhisperTray:
             keyboard.on_press_key(self._hotkey, lambda e: self.on_key_down(), suppress=False)
             keyboard.on_release_key(self._hotkey, lambda e: self.on_key_up(), suppress=False)
             self._chord_trigger_key = None
+        # Register dictation toggle hotkey
+        if self._is_chord(self._dictation_hotkey):
+            keyboard.add_hotkey(self._dictation_hotkey, self.on_dictation_toggle, suppress=False)
+        else:
+            keyboard.on_press_key(self._dictation_hotkey, lambda e: self.on_dictation_toggle(), suppress=False)
+        # Register Escape to cancel recording (always active, gated by is_recording)
+        keyboard.on_press_key("esc", lambda e: self._cancel_recording(), suppress=False)
+
+    def _cleanup_nav_hooks_async(self):
+        """Clean up multi-model nav hooks off the keyboard thread to avoid deadlock."""
+        hooks = list(getattr(self, '_nav_hooks', []))
+        self._nav_hooks = []
+        if hooks:
+            def _do():
+                import keyboard as kb
+                for h in hooks:
+                    try:
+                        kb.unhook(h)
+                    except (ValueError, KeyError):
+                        pass
+            threading.Thread(target=_do, daemon=True, name="unhook-nav").start()
 
     def _chord_release_check(self):
         """For chord hotkeys, trigger on_key_up when the trigger key is released."""
@@ -660,11 +2635,62 @@ class WhisperTray:
         self._hotkey = new_key
         self._register_hotkey()
         print(f"[KEY  ] Hotkey changed to {new_key.upper()}")
+        self._save_config()
         self._rebuild_tray_menu()
 
     def hotkey_loop(self):
         self._register_hotkey()
+        self._start_session_watchdog()
         self._stop_event.wait()
+
+    def _start_session_watchdog(self):
+        """Watch for Windows session lock/unlock and re-register hooks on unlock."""
+        def _watchdog():
+            import ctypes
+            import ctypes.wintypes
+            user32 = ctypes.windll.user32
+            # Proper 64-bit handle types for Win32 API
+            user32.OpenInputDesktop.restype = ctypes.wintypes.HDESK
+            user32.CloseDesktop.argtypes = [ctypes.wintypes.HDESK]
+            DESKTOP_READOBJECTS = 0x0001
+            locked_count = 0       # debounce: require consecutive failures
+            LOCK_THRESHOLD = 3     # must fail 3 polls (~6s) to count as locked
+            was_locked = False
+            while not self._stop_event.is_set():
+                self._stop_event.wait(2)
+                if self._stop_event.is_set():
+                    break
+                try:
+                    hDesk = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+                except Exception:
+                    locked_count += 1
+                    continue
+                if hDesk:
+                    user32.CloseDesktop(hDesk)
+                    if was_locked:
+                        was_locked = False
+                        locked_count = 0
+                        # Don't rehook mid-recording
+                        if self.is_recording:
+                            print("[HOOK ] Session unlocked mid-recording, deferring rehook.")
+                            continue
+                        print("[HOOK ] Session unlocked — re-registering keyboard hooks.")
+                        try:
+                            self._unregister_hotkey()
+                        except Exception:
+                            pass
+                        try:
+                            self._register_hotkey()
+                        except Exception as e:
+                            print(f"[HOOK ] Failed to re-register hooks: {e}")
+                    else:
+                        locked_count = 0
+                else:
+                    locked_count += 1
+                    if not was_locked and locked_count >= LOCK_THRESHOLD:
+                        was_locked = True
+                        print("[HOOK ] Session appears locked.")
+        threading.Thread(target=_watchdog, daemon=True, name="session-watchdog").start()
 
     # -- Device toggle -------------------------
 
@@ -673,90 +2699,612 @@ class WhisperTray:
             print("[WARN ] CUDA not available on this system.")
             return
         self._use_cuda = not self._use_cuda
+        self._save_config()
         threading.Thread(target=self.reload_model, daemon=True).start()
 
     def _toggle_chime(self):
         self._chime_enabled = not self._chime_enabled
         state = "on" if self._chime_enabled else "off"
         print(f"[CHIME] Sound chimes {state}")
+        self._save_config()
 
-    def _toggle_privacy_mic(self):
-        self._privacy_mic = not self._privacy_mic
-        def _do():
-            if self._privacy_mic:
-                self._close_audio_stream()
-                print("[MIC  ] Privacy mic mode enabled: stream opens only while recording.")
+    def _get_installed_models(self):
+        """Query Ollama for locally available models."""
+        try:
+            data = self._ollama_get("/api/tags")
+            return [m["name"] for m in data.get("models", [])]
+        except Exception:
+            return []
+
+    def _pull_model(self, model_name):
+        """Pull a model from Ollama, showing progress in the bubble."""
+        import subprocess
+        self.bubble.show(f"Pulling {model_name}...", style="transcribing")
+        print(f"[LLM  ] Pulling model: {model_name}")
+        try:
+            result = subprocess.run(
+                ["ollama", "pull", model_name],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                print(f"[LLM  ] Pull complete: {model_name}")
+                self.bubble.show(f"{model_name} ready!", style="result", duration=2)
+                return True
             else:
-                self._open_audio_stream()
-                print("[MIC  ] Privacy mic mode disabled: always-on mic stream started.")
-        threading.Thread(target=_do, daemon=True).start()
+                print(f"[LLM  ] Pull failed: {result.stderr.strip()}")
+                self.bubble.show(f"Pull failed: {model_name}", style="transcribing", duration=3)
+                return False
+        except subprocess.TimeoutExpired:
+            print(f"[LLM  ] Pull timed out: {model_name}")
+            self.bubble.show(f"Pull timed out: {model_name}", style="transcribing", duration=3)
+            return False
+        except Exception as e:
+            print(f"[LLM  ] Pull error: {e}")
+            self.bubble.show(f"Pull error: {model_name}", style="transcribing", duration=3)
+            return False
+
+    def _set_llm_model(self, model_name):
+        """Switch to a different Ollama model, pulling if needed."""
+        def _do_switch():
+            installed = self._get_installed_models()
+            if model_name not in installed:
+                success = self._pull_model(model_name)
+                if not success:
+                    return
+            self._llm_model = model_name
+            print(f"[LLM  ] Model: {model_name}")
+            self._save_config()
+            self._rebuild_tray_menu()
+
+        threading.Thread(target=_do_switch, daemon=True).start()
+
+    def _unload_ollama_model(self):
+        """Tell Ollama to unload the current model from memory."""
+        try:
+            self._ollama_post("/api/generate", {
+                "model": self._llm_model,
+                "keep_alive": 0,
+                "stream": False,
+            }, timeout=5)
+            print(f"[LLM  ] Unloaded {self._llm_model} from memory")
+        except Exception as e:
+            print(f"[LLM  ] Failed to unload model: {e}")
+
+    def _warm_ollama_model(self):
+        """Pre-load the Ollama model into memory so the first real call is fast."""
+        log.debug("_warm_ollama_model START")
+        self._ollama_ready.clear()
+        self.bubble.show(f"Loading {self._llm_model}...", style="transcribing")
+        try:
+            log.debug("_warm_ollama_model: calling ollama...")
+            self._call_ollama("Hello")
+            log.debug("_warm_ollama_model: DONE")
+            print(f"[LLM  ] Model {self._llm_model} warmed up.")
+            self.bubble.show(f"{self._llm_model} ready!", style="result", duration=3)
+        except Exception as e:
+            log.error(f"_warm_ollama_model FAILED: {e}")
+            print(f"[LLM  ] Warm-up failed: {e}")
+            self.bubble.show(f"LLM unavailable: {e}", style="transcribing", duration=3)
+        finally:
+            log.debug("_warm_ollama_model: setting ollama_ready")
+            self._ollama_ready.set()
+
+    def _toggle_llm_cleanup(self):
+        self._llm_cleanup = not self._llm_cleanup
+        state = "on" if self._llm_cleanup else "off"
+        print(f"[LLM  ] Text cleanup {state}")
+        if self._llm_cleanup:
+            threading.Thread(target=self._warm_ollama_model, daemon=True).start()
+        else:
+            threading.Thread(target=self._unload_ollama_model, daemon=True).start()
+        self._save_config()
         self._rebuild_tray_menu()
+
+    def _set_llm_prompt(self, name):
+        self._llm_prompt = name
+        print(f"[LLM  ] Prompt style: {name}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _toggle_preview_style(self, name):
+        if name in self._llm_preview_styles:
+            if len(self._llm_preview_styles) > 1:
+                self._llm_preview_styles.remove(name)
+            else:
+                print("[LLM  ] Must have at least one preview style selected.")
+                return
+        else:
+            self._llm_preview_styles.append(name)
+        print(f"[LLM  ] Preview styles: {', '.join(self._llm_preview_styles)}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _toggle_llm_debug(self):
+        self._llm_debug = not self._llm_debug
+        state = "on" if self._llm_debug else "off"
+        print(f"[LLM  ] Multi-Model Preview {state}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _toggle_auto_submit(self):
+        self._auto_submit = not self._auto_submit
+        state = "on" if self._auto_submit else "off"
+        print(f"[LLM  ] Auto-submit {state}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _set_whisper_model(self, model_name):
+        """Switch Whisper model (downloads automatically via faster-whisper)."""
+        self._whisper_model = model_name
+        self._save_config()
+        threading.Thread(target=self.reload_model, daemon=True).start()
+
+    def _toggle_tone_detect(self):
+        self._tone_detect = not self._tone_detect
+        state = "on" if self._tone_detect else "off"
+        print(f"[TONE ] Tone detection {state}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _set_translate_lang(self, lang):
+        """Set translation language. None = off."""
+        if self._translate_lang == lang:
+            self._translate_lang = None
+            print(f"[TRANS] Translation off")
+        else:
+            self._translate_lang = lang
+            print(f"[TRANS] Translate to: {lang}")
+        self._save_config()
+        self._rebuild_tray_menu()
+
+    def _open_history(self):
+        """Open history log in default text editor."""
+        if not os.path.exists(self._history_path):
+            print("[HIST ] No history yet.")
+            return
+        os.startfile(self._history_path)
+
+    def _clear_history(self):
+        self._history = []
+        self._save_history()
+        print("[HIST ] History cleared.")
+
+    # -- Settings window -----------------------
+
+    def _open_settings(self):
+        """Open a persistent settings dialog on the Bubble's tkinter thread."""
+        def _build():
+            if hasattr(self, '_settings_win') and self._settings_win and self._settings_win.winfo_exists():
+                self._settings_win.lift()
+                self._settings_win.focus_force()
+                return
+
+            win = tk.Toplevel(self.bubble._root)
+            self._settings_win = win
+            win.title("Whisper STT Settings")
+            win.attributes("-topmost", True)
+            win.resizable(False, False)
+
+            # --- Theme ---
+            BG = "#16171c"
+            CARD = "#1e2028"
+            CARD_BORDER = "#2a2c36"
+            FG = "#d4d6de"
+            FG_DIM = "#808494"
+            ACCENT = Bubble._accent_hex
+            FIELD_BG = "#282a34"
+            HOVER = "#32343e"
+            FONT = ("Segoe UI", 10)
+            FONT_BOLD = ("Segoe UI", 10, "bold")
+            FONT_HEADER = ("Segoe UI", 11, "bold")
+            FONT_TITLE = ("Segoe UI", 14, "bold")
+
+            win.configure(bg=BG)
+
+            # --- Title bar area ---
+            title_frame = tk.Frame(win, bg=BG)
+            title_frame.pack(fill="x", padx=20, pady=(16, 4))
+            tk.Label(title_frame, text="Settings", font=FONT_TITLE, bg=BG, fg=FG,
+                     anchor="w").pack(side="left")
+            tk.Label(title_frame, text="Whisper STT", font=FONT, bg=BG, fg=FG_DIM,
+                     anchor="e").pack(side="right")
+
+            # Accent divider line
+            div = tk.Frame(win, bg=ACCENT, height=2)
+            div.pack(fill="x", padx=20, pady=(0, 8))
+
+            # --- Helpers ---
+            def make_card(parent):
+                """Create a rounded-looking card frame."""
+                card = tk.Frame(parent, bg=CARD, highlightbackground=CARD_BORDER,
+                                highlightthickness=1, padx=14, pady=10)
+                return card
+
+            def section_label(parent, text):
+                tk.Label(parent, text=text, font=FONT_HEADER, bg=CARD, fg=ACCENT,
+                         anchor="w").pack(fill="x", pady=(0, 6))
+
+            def add_toggle(parent, label, var, command=None):
+                f = tk.Frame(parent, bg=CARD)
+                f.pack(fill="x", pady=2)
+                cb = tk.Checkbutton(f, text=label, variable=var, font=FONT,
+                                    bg=CARD, fg=FG, selectcolor=FIELD_BG,
+                                    activebackground=CARD, activeforeground=FG,
+                                    anchor="w", command=command)
+                cb.pack(side="left")
+                return cb
+
+            def add_dropdown(parent, label, var, options, command=None):
+                f = tk.Frame(parent, bg=CARD)
+                f.pack(fill="x", pady=2)
+                tk.Label(f, text=label, font=FONT, bg=CARD, fg=FG,
+                         anchor="w").pack(side="left")
+                om = tk.OptionMenu(f, var, *options, command=command)
+                om.config(font=FONT, bg=FIELD_BG, fg=FG, activebackground=HOVER,
+                          activeforeground=FG, highlightthickness=0, relief="flat",
+                          borderwidth=1)
+                om["menu"].config(bg=FIELD_BG, fg=FG, font=FONT,
+                                  activebackground=ACCENT, activeforeground="#FFFFFF",
+                                  borderwidth=0)
+                om.pack(side="right")
+                return om
+
+            # --- Two-column layout ---
+            columns = tk.Frame(win, bg=BG)
+            columns.pack(fill="both", expand=True, padx=16, pady=4)
+            columns.columnconfigure(0, weight=1)
+            columns.columnconfigure(1, weight=1)
+
+            # ══════════ LEFT COLUMN ══════════
+            left = tk.Frame(columns, bg=BG)
+            left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+            # -- Recording card --
+            rec_card = make_card(left)
+            rec_card.pack(fill="x", pady=(0, 8))
+            section_label(rec_card, "Recording")
+
+            hotkey_var = tk.StringVar(value=self._hotkey)
+            add_dropdown(rec_card, "Hotkey", hotkey_var, HOTKEY_OPTIONS,
+                         command=lambda v: self.change_hotkey(v))
+
+            chime_var = tk.BooleanVar(value=self._chime_enabled)
+            def _on_chime():
+                self._chime_enabled = chime_var.get()
+                self._save_config()
+            add_toggle(rec_card, "Sound chimes", chime_var, _on_chime)
+
+            privacy_var = tk.BooleanVar(value=self._privacy_mic)
+            def _on_privacy():
+                self._privacy_mic = privacy_var.get()
+                def _do():
+                    if self._privacy_mic:
+                        self._close_audio_stream()
+                        print("[MIC  ] Privacy mic mode enabled.")
+                    else:
+                        self._open_audio_stream()
+                        print("[MIC  ] Privacy mic mode disabled.")
+                threading.Thread(target=_do, daemon=True).start()
+                self._save_config()
+            add_toggle(rec_card, "Privacy mic", privacy_var, _on_privacy)
+
+            remote_var = tk.BooleanVar(value=self._remote_mode)
+            def _on_remote():
+                self._remote_mode = remote_var.get()
+                state = "Mac Mini" if self._remote_mode else "local whisper"
+                print(f"[STT  ] Transcription routed to {state} ({self._remote_url}).")
+                self._save_config()
+            add_toggle(rec_card, "Remote STT (Mac Mini)", remote_var, _on_remote)
+
+            bubble_dur_var = tk.StringVar(value=str(self._bubble_duration))
+            def _on_bubble_dur(v):
+                self._bubble_duration = int(v)
+                self._save_config()
+            add_dropdown(rec_card, "Bubble duration (s)", bubble_dur_var,
+                         ["0", "1", "2", "3", "4", "5", "7", "10"],
+                         command=_on_bubble_dur)
+
+            wave_style_var = tk.StringVar(value=self._waveform_style)
+            def _on_wave_style(v):
+                self._waveform_style = v
+                self.bubble.waveform_style = v
+                self._save_config()
+            add_dropdown(rec_card, "Visualizer", wave_style_var,
+                         ["Bars", "Pixel", "Wave"], command=_on_wave_style)
+
+            bars_var = tk.StringVar(value=str(self._num_bars))
+            def _on_bars(v):
+                self._num_bars = int(v)
+                self.bubble.num_bars = int(v)
+                self._save_config()
+            add_dropdown(rec_card, "Bar count", bars_var,
+                         ["6", "8", "10", "12", "16", "20", "24", "32"],
+                         command=_on_bars)
+
+            cells_var = tk.StringVar(value=str(self._cells_per_bar))
+            def _on_cells(v):
+                self._cells_per_bar = int(v)
+                self.bubble.cells_per_bar = int(v)
+                self._save_config()
+            add_dropdown(rec_card, "Cells per bar", cells_var,
+                         ["2", "3", "4", "5", "6", "8"],
+                         command=_on_cells)
+
+            theme_var = tk.StringVar(value=self._color_theme)
+            def _on_theme(v):
+                self._color_theme = v
+                Bubble.set_theme(v)
+                self._save_config()
+            add_dropdown(rec_card, "Color theme", theme_var,
+                         list(THEMES.keys()), command=_on_theme)
+
+            live_var = tk.BooleanVar(value=self._live_preview)
+            def _on_live():
+                self._live_preview = live_var.get()
+                self._save_config()
+            add_toggle(rec_card, "Live preview", live_var, _on_live)
+
+            font_choices = [
+                "Segoe UI", "Cascadia Code", "Consolas", "Calibri",
+                "Arial", "Verdana", "Tahoma", "Trebuchet MS",
+                "Georgia", "Cambria", "Palatino Linotype",
+                "Comic Sans MS", "Courier New", "Lucida Console",
+            ]
+            font_var = tk.StringVar(value=self._display_font)
+            def _on_font(v):
+                self._display_font = v
+                self.bubble.set_display_font(v)
+                self._save_config()
+            add_dropdown(rec_card, "Font", font_var, font_choices, command=_on_font)
+
+            # -- Model card --
+            model_card = make_card(left)
+            model_card.pack(fill="x", pady=(0, 8))
+            section_label(model_card, "Whisper Model")
+
+            whisper_var = tk.StringVar(value=self._whisper_model)
+            add_dropdown(model_card, "Model", whisper_var, WHISPER_MODEL_OPTIONS,
+                         command=lambda v: self._set_whisper_model(v))
+
+            if self._cuda_available:
+                cuda_var = tk.BooleanVar(value=self._use_cuda)
+                def _on_cuda():
+                    self._use_cuda = cuda_var.get()
+                    self._cuda_verified = False  # re-test on next cold boot
+                    self._save_config()
+                    threading.Thread(target=self.reload_model, daemon=True).start()
+                add_toggle(model_card, "Use GPU (CUDA)", cuda_var, _on_cuda)
+
+            # -- Translation card --
+            trans_card = make_card(left)
+            trans_card.pack(fill="x", pady=(0, 8))
+            section_label(trans_card, "Translation")
+
+            trans_var = tk.StringVar(value=self._translate_lang or "Off")
+            def _on_translate(v):
+                self._set_translate_lang(None if v == "Off" else v)
+            add_dropdown(trans_card, "Translate to", trans_var,
+                         ["Off"] + TRANSLATE_LANGS, command=_on_translate)
+
+            # -- History card --
+            hist_card = make_card(left)
+            hist_card.pack(fill="x", pady=(0, 8))
+            section_label(hist_card, "History")
+
+            hist_row = tk.Frame(hist_card, bg=CARD)
+            hist_row.pack(fill="x")
+            tk.Label(hist_row, text=f"{len(self._history)} entries", font=FONT,
+                     bg=CARD, fg=FG_DIM).pack(side="left")
+            for btn_text, btn_cmd in [("Clear", self._clear_history), ("Open", self._open_history)]:
+                b = tk.Button(hist_row, text=btn_text, font=FONT, bg=FIELD_BG, fg=FG,
+                              activebackground=HOVER, activeforeground=FG,
+                              relief="flat", borderwidth=0, padx=10, pady=2,
+                              command=btn_cmd)
+                b.pack(side="right", padx=(4, 0))
+
+            # ══════════ RIGHT COLUMN ══════════
+            right = tk.Frame(columns, bg=BG)
+            right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+            # -- LLM card --
+            llm_card = make_card(right)
+            llm_card.pack(fill="x", pady=(0, 8))
+            section_label(llm_card, "LLM Text Cleanup")
+
+            llm_var = tk.BooleanVar(value=self._llm_cleanup)
+            def _on_llm():
+                self._llm_cleanup = llm_var.get()
+                if self._llm_cleanup:
+                    threading.Thread(target=self._warm_ollama_model, daemon=True).start()
+                else:
+                    threading.Thread(target=self._unload_ollama_model, daemon=True).start()
+                self._save_config()
+                self._rebuild_tray_menu()
+            add_toggle(llm_card, "Enable LLM cleanup", llm_var, _on_llm)
+
+            llm_model_var = tk.StringVar(value=self._llm_model)
+            model_om = add_dropdown(llm_card, "LLM model", llm_model_var,
+                                    LLM_MODEL_OPTIONS,
+                                    command=lambda v: self._set_llm_model(v))
+
+            def _refresh_model_labels():
+                installed = self._get_installed_models()
+                def _update():
+                    if not win.winfo_exists():
+                        return
+                    menu = model_om["menu"]
+                    menu.delete(0, "end")
+                    for m in LLM_MODEL_OPTIONS:
+                        label = m if m in installed else f"{m}  [pull]"
+                        menu.add_command(label=label,
+                                         command=lambda v=m: (llm_model_var.set(v), self._set_llm_model(v)))
+                win.after(0, _update)
+            threading.Thread(target=_refresh_model_labels, daemon=True).start()
+
+            prompt_var = tk.StringVar(value=self._llm_prompt)
+            add_dropdown(llm_card, "Active style", prompt_var,
+                         list(LLM_PROMPTS.keys()),
+                         command=lambda v: self._set_llm_prompt(v))
+
+            tone_var = tk.BooleanVar(value=self._tone_detect)
+            def _on_tone():
+                self._tone_detect = tone_var.get()
+                self._save_config()
+                self._rebuild_tray_menu()
+            add_toggle(llm_card, "Tone detection (emoji prefix)", tone_var, _on_tone)
+
+            # -- Multi-Model Preview card --
+            preview_card = make_card(right)
+            preview_card.pack(fill="x", pady=(0, 8))
+            section_label(preview_card, "Multi-Model Preview")
+
+            debug_var = tk.BooleanVar(value=self._llm_debug)
+            def _on_debug():
+                self._llm_debug = debug_var.get()
+                self._save_config()
+                self._rebuild_tray_menu()
+            add_toggle(preview_card, "Enable preview", debug_var, _on_debug)
+
+            auto_var = tk.BooleanVar(value=self._auto_submit)
+            def _on_auto():
+                self._auto_submit = auto_var.get()
+                self._save_config()
+            add_toggle(preview_card, "Auto-submit (Enter sends)", auto_var, _on_auto)
+
+            # Style checkboxes with colored labels
+            tk.Label(preview_card, text="Preview styles", font=FONT, bg=CARD,
+                     fg=FG_DIM, anchor="w").pack(fill="x", pady=(6, 2))
+
+            style_vars = {}
+            for name in LLM_PROMPTS:
+                svar = tk.BooleanVar(value=(name in self._llm_preview_styles))
+                style_vars[name] = svar
+                color = self.bubble._debug_colors.get(name, "#FFFFFF")
+
+                def _on_style_toggle(n=name):
+                    checked = [k for k, v in style_vars.items() if v.get()]
+                    if not checked:
+                        style_vars[n].set(True)
+                        return
+                    self._llm_preview_styles = checked
+                    self._save_config()
+
+                cb = tk.Checkbutton(preview_card, text=name, variable=svar, font=FONT,
+                                    bg=CARD, fg=color, selectcolor=FIELD_BG,
+                                    activebackground=CARD, activeforeground=color,
+                                    anchor="w", command=_on_style_toggle)
+                cb.pack(fill="x", padx=(12, 0))
+
+            # -- Features card --
+            feat_card = make_card(right)
+            feat_card.pack(fill="x", pady=(0, 8))
+            section_label(feat_card, "Features")
+
+            autopunct_var = tk.BooleanVar(value=self._auto_punctuate)
+            def _on_autopunct():
+                self._auto_punctuate = autopunct_var.get()
+                self._save_config()
+            add_toggle(feat_card, "Auto-punctuate", autopunct_var, _on_autopunct)
+
+            conf_var = tk.BooleanVar(value=self._confidence_coloring)
+            def _on_conf():
+                self._confidence_coloring = conf_var.get()
+                self._save_config()
+            add_toggle(feat_card, "Confidence coloring", conf_var, _on_conf)
+
+            scratch_var = tk.BooleanVar(value=self._scratch_that)
+            def _on_scratch():
+                self._scratch_that = scratch_var.get()
+                self._save_config()
+            add_toggle(feat_card, "\"Scratch that\" undo", scratch_var, _on_scratch)
+
+            idle_var = tk.BooleanVar(value=self._idle_breathing)
+            def _on_idle():
+                self._idle_breathing = idle_var.get()
+                self._save_config()
+                if self._idle_breathing and not self._recording:
+                    self.bubble.start_idle_breathing()
+                elif not self._idle_breathing:
+                    self.bubble.stop_idle_breathing()
+            add_toggle(feat_card, "Idle breathing animation", idle_var, _on_idle)
+
+            tray_viz_var = tk.BooleanVar(value=self._tray_visualizer)
+            def _on_tray_viz():
+                self._tray_visualizer = tray_viz_var.get()
+                self._save_config()
+                if self._tray_visualizer and not self._recording:
+                    self._start_tray_idle()
+                elif not self._tray_visualizer:
+                    self._stop_tray_animations()
+            add_toggle(feat_card, "Tray visualizer", tray_viz_var, _on_tray_viz)
+
+            dict_hotkey_var = tk.StringVar(value=self._dictation_hotkey)
+            def _on_dict_hotkey(v):
+                self._dictation_hotkey = v
+                self._save_config()
+                threading.Thread(target=self._register_hotkey, daemon=True).start()
+            add_dropdown(feat_card, "Dictation hotkey", dict_hotkey_var,
+                         HOTKEY_OPTIONS, command=_on_dict_hotkey)
+
+            # ── Close button ──
+            btn_frame = tk.Frame(win, bg=BG)
+            btn_frame.pack(fill="x", padx=16, pady=(4, 16))
+            close_btn = tk.Button(btn_frame, text="Close", font=FONT_BOLD,
+                                  bg=FIELD_BG, fg=FG, activebackground=ACCENT,
+                                  activeforeground="#FFFFFF", relief="flat",
+                                  borderwidth=0, padx=24, pady=6,
+                                  command=win.destroy)
+            close_btn.pack(side="right")
+
+            # Center on screen
+            win.update_idletasks()
+            ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry(f"+{(sw - ww) // 2}+{(sh - wh) // 2}")
+
+        self.bubble._root.after(0, _build)
 
     # -- Tray ----------------------------------
 
     def _rebuild_tray_menu(self):
         import pystray
 
-        device_label = f"Device: {self._device.upper()}"
-        if self._cuda_available:
-            device_item = pystray.MenuItem(
-                device_label + " (click to toggle)",
-                lambda icon, item: self.toggle_device(),
-            )
-        else:
-            device_item = pystray.MenuItem(
-                device_label + " (CUDA not available)",
-                lambda: None,
-                enabled=False,
-            )
-
-        # Build hotkey submenu with categories
-        def _make_hotkey_handler(key):
-            return lambda icon, item: self.change_hotkey(key)
-
-        def _make_hotkey_item(key):
-            return pystray.MenuItem(
-                key.upper(),
-                _make_hotkey_handler(key),
-                checked=lambda item, k=key: k == self._hotkey,
-                radio=True,
-            )
-
-        fkeys = [k for k in HOTKEY_OPTIONS if not "+" in k]
-        chords = [k for k in HOTKEY_OPTIONS if "+" in k]
-
-        hotkey_items = [_make_hotkey_item(k) for k in fkeys]
-        if chords:
-            hotkey_items.append(pystray.Menu.SEPARATOR)
-            hotkey_items.extend([_make_hotkey_item(k) for k in chords])
-
-        chime_item = pystray.MenuItem(
-            "Sound chimes",
-            lambda icon, item: self._toggle_chime(),
-            checked=lambda item: self._chime_enabled,
-        )
-
-        privacy_item = pystray.MenuItem(
-            "Privacy mic (open only while recording)",
-            lambda icon, item: self._toggle_privacy_mic(),
-            checked=lambda item: self._privacy_mic,
-        )
+        llm_status = f"LLM: {self._llm_model}" if self._llm_cleanup else "LLM: off"
+        translate_status = f" | Translate → {self._translate_lang}" if self._translate_lang else ""
 
         menu = pystray.Menu(
-            pystray.MenuItem(f"Hold {self._hotkey.upper()} to record", lambda: None, enabled=False),
-            pystray.MenuItem(f"Model: {WHISPER_MODEL}", lambda: None, enabled=False),
-            device_item,
+            pystray.MenuItem(
+                f"Hold {self._hotkey.upper()} to record (Esc to cancel)",
+                lambda: None,
+                enabled=False,
+            ),
+            pystray.MenuItem(
+                f"Whisper: {self._whisper_model} | {self._device.upper()}{translate_status}",
+                lambda: None,
+                enabled=False,
+            ),
+            pystray.MenuItem(
+                llm_status,
+                lambda: None,
+                enabled=False,
+            ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Hotkey", pystray.Menu(*hotkey_items)),
-            chime_item,
-            privacy_item,
-            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Settings...", lambda icon, item: self._open_settings()),
+            pystray.MenuItem("Restart Service", self._restart_app),
             pystray.MenuItem("Quit", self.quit_app),
         )
 
         if self.tray:
             self.tray.menu = menu
             self.tray.update_menu()
+
+    def _restart_app(self, icon, item):
+        """Restart the app by launching a new process and exiting this one."""
+        import subprocess
+        print("[RESTART] Restarting service...")
+        script = os.path.abspath(__file__)
+        subprocess.Popen([sys.executable, script], creationflags=0x00000008)  # DETACHED_PROCESS
+        self.quit_app(icon, item)
 
     def quit_app(self, icon, item):
         self._stop_event.set()
@@ -777,10 +3325,29 @@ class WhisperTray:
         else:
             print(f"[CPU  ] No CUDA detected, using CPU.")
 
+        ollama_parallel = os.environ.get("OLLAMA_NUM_PARALLEL", "")
+        if not ollama_parallel:
+            print(f"[TIP  ] Set OLLAMA_NUM_PARALLEL=4 as a system env var and restart Ollama")
+            print(f"[TIP  ] for faster Multi-Model Preview (parallel LLM inference).")
+        else:
+            print(f"[LLM  ] OLLAMA_NUM_PARALLEL={ollama_parallel}")
+
         self.load_model()
 
         # Start overlay bubble with live FFT feed
         self.bubble = Bubble(fft_callback=self.get_fft_bars)
+        Bubble.set_theme(self._color_theme)
+        self.bubble.waveform_style = self._waveform_style
+        self.bubble.num_bars = self._num_bars
+        self.bubble.cells_per_bar = self._cells_per_bar
+        self.bubble.set_display_font(self._display_font)
+
+        # Poll Windows accent color changes (e.g. rotating themes)
+        self._start_accent_poll()
+
+        # Start idle animations if enabled
+        if self._idle_breathing:
+            self.bubble.start_idle_breathing()
 
         # Audio stream setup
         self._sd = sd
@@ -793,6 +3360,10 @@ class WhisperTray:
             self._open_audio_stream()
             print(f"[MIC  ] Always-on mic stream started.")
 
+        # Pre-warm Ollama model if LLM cleanup is enabled
+        if self._llm_cleanup:
+            threading.Thread(target=self._warm_ollama_model, daemon=True).start()
+
         # Start hotkey listener in background thread
         hotkey_thread = threading.Thread(target=self.hotkey_loop, daemon=True)
         hotkey_thread.start()
@@ -804,6 +3375,13 @@ class WhisperTray:
             "Whisper STT (Ready)",
         )
         self._rebuild_tray_menu()
+
+        # Start tray idle animation if enabled
+        if self._tray_visualizer:
+            self._start_tray_idle()
+
+        # Start WebSocket bridge for dashboard integration
+        self.ws_bridge.start()
 
         print(f"[TRAY ] Running in system tray. Hold {self._hotkey.upper()} to record.")
         self.tray.run()

@@ -58,7 +58,7 @@ First launch downloads the Whisper model (~150MB). Needs internet once.
   - Red waveform = recording
   - Yellow waveform = transcribing
   - Green waveform + white text = result (can be disabled)
-- **Privacy mic mode** -- microphone is only open while you hold the hotkey. No always-on listening. Toggleable from the tray menu
+- **Privacy mic mode** -- microphone is only open while you hold the hotkey. No always-on listening. Toggleable in settings
 - **Smooth animations** -- fade in/out transitions, smoothed FFT bars
 - **Duplicate instance protection** -- launching again kills the old instance first
 
